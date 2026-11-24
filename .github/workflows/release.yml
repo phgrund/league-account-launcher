@@ -1,4 +1,4 @@
-name: Build and Release
+name: Build Windows installer
 
 on:
   push:
@@ -6,71 +6,24 @@ on:
       - 'v*'
 
 jobs:
-  release:
+  build:
     runs-on: windows-latest
     permissions:
-      contents: write
-
+      contents: read
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          fetch-depth: 0   # full history so generate-notes covers all commits
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          # 22+: node --test expands the test/**/*.test.js glob itself
           node-version: 22
-          cache: 'npm'
-
-      - name: Install dependencies
-        run: npm ci
-
-      # Release gate: no installer is built from a commit with a failing test.
-      - name: Run tests
-        run: npm test
-
+          cache: npm
+      - run: npm ci
+      - run: npm test
       - name: Set version from tag
         shell: pwsh
-        run: |
-          $VERSION = "${{ github.ref_name }}" -replace "^v", ""
-          npm version $VERSION --no-git-tag-version --allow-same-version
-
-      - name: Build and publish
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: npm run build
-        # electron-builder creates the release and uploads exe + latest.yml + blockmap
-        # latest.yml must be published by electron-builder — it encodes the SHA512/size
-        # in a format electron-updater understands; uploading it manually causes 404s
-
-      - name: Set release title and changelog
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          $VERSION = "${{ github.ref_name }}"
-          $TITLE   = "Lost League Manager $VERSION"
-
-          # The hand-written notes for this version (docs/releases/v<version>.md)
-          # when they exist, otherwise GitHub's changelog of commits since the last tag.
-          $NOTES_FILE = "docs/releases/$VERSION.md"
-          if (Test-Path $NOTES_FILE) {
-            # Drop the first line ("Lost League Manager <version>"): it is the release title.
-            $BODY = ((Get-Content $NOTES_FILE -Encoding utf8 | Select-Object -Skip 1) -join "`n").Trim()
-          } else {
-            $BODY = gh api "repos/${{ github.repository }}/releases/generate-notes" `
-              -f tag_name=$VERSION `
-              --jq '.body'
-          }
-
-          gh release edit $VERSION --title $TITLE --notes $BODY --draft=false
-
-      - name: Upload installer artifact
-        uses: actions/upload-artifact@v4
-        if: always()
+        run: npm version ($env:GITHUB_REF_NAME -replace '^v', '') --no-git-tag-version --allow-same-version
+      - run: npm run build
+      - uses: actions/upload-artifact@v4
         with:
           name: installer-${{ github.ref_name }}
           path: dist/*.exe
-          retention-days: 30
+          if-no-files-found: error

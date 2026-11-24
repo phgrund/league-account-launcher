@@ -1,6 +1,7 @@
 const { app, BrowserWindow, Tray, Menu, screen } = require('electron');
 const path = require('path');
 const state = require('./state');
+const { accountLaunchArguments } = require('./services/account-shortcut');
 
 let _launchCallback = null;
 
@@ -12,16 +13,13 @@ function setLaunchCallback(fn) {
 const launchModule = () => require('./ipc/launch');
 
 function createMainWindow() {
-    const scale  = state.config.uiScale || 1.0;
-    const { width: sw, height: sh } = screen.getPrimaryDisplay().workAreaSize;
-    const width  = Math.min(scale !== 1.0 ? Math.round(1100 * scale) : 1100, sw);
-    const height = Math.min(scale !== 1.0 ? Math.round(680  * scale) : 680,  sh);
+    const { width, height } = screen.getPrimaryDisplay().workAreaSize;
     state.mainWindow = new BrowserWindow({
-        width,
-        height,
-        frame: false,
-        transparent: true,
-        resizable: false,
+        width: Math.min(760, width),
+        height: Math.min(600, height),
+        minWidth: 500,
+        minHeight: 420,
+        autoHideMenuBar: true,
         show: false,
         icon: path.join(__dirname, '../renderer/assets/logo.ico'),
         webPreferences: {
@@ -50,116 +48,15 @@ function createMainWindow() {
         }
     });
 
-    state.mainWindow.on('closed', () => {
-        if (state.overlayWindow && !state.overlayWindow.isDestroyed()) {
-            state.overlayWindow.destroy();
-            state.overlayWindow = null;
-        }
-    });
+    state.mainWindow.on('closed', () => { state.mainWindow = null; });
 }
 
-function createOverlayWindow(owOverlay, onReady = null) {
-    const { width: sw } = screen.getPrimaryDisplay().workAreaSize;
-    const w = 388; // .ov-root in overlay.css plus its padding; the page sets the height
-    // The last place the player dragged it to, else the top right.
-    const saved = Number.isInteger(state.config.overlayX) && Number.isInteger(state.config.overlayY);
-    const opts = {
-        name: 'overlay',
-        width: w,
-        height: 62,
-        x: saved ? state.config.overlayX : sw - w - 16,
-        y: saved ? state.config.overlayY : 16,
-        transparent: true,
-        frame: false,
-        resizable: false,
-        skipTaskbar: true,
-        // Never activated: clicks reach it, but the keyboard stays with League
-        // (a focused overlay swallowed every key until the game was clicked).
-        focusable: false,
-        show: false,
-        webPreferences: {
-            preload: path.join(__dirname, '../preload/overlay-preload.js'),
-            nodeIntegration: false,
-            contextIsolation: true,
-            devTools: !app.isPackaged,
-        },
-    };
-
-    const finish = (rawWin) => {
-        const bw = rawWin?.window ?? rawWin?.browserWindow ?? rawWin;
-        if (!bw) throw new Error('[Overlay] Window handle missing after createWindow');
-
-        state.overlayWindow = bw;
-
-        state.overlayWindow.setIgnoreMouseEvents(true, { forward: true });
-        // Keep the place the player dragged it to (Lock in the overlay
-        // stops dragging; Reset position forgets it).
-        let moveTimer = null;
-        state.overlayWindow.on?.('moved', () => {
-            clearTimeout(moveTimer);
-            moveTimer = setTimeout(() => {
-                if (!state.overlayWindow || state.overlayWindow.isDestroyed()) return;
-                const [x, y] = state.overlayWindow.getPosition();
-                state.config.overlayX = x;
-                state.config.overlayY = y;
-                require('./services/storage').saveConfig();
-            }, 400);
-        });
-        state.overlayWindow.loadFile(path.join(__dirname, '../renderer/overlay.html'));
-
-        const sendInit = () => {
-            if (!state.overlayWindow || state.overlayWindow.isDestroyed()) return;
-            const championData = require('./services/champion-data');
-            const itemData = require('./services/item-data');
-            // Opacity is applied by the page (CSS); setOpacity does not work on
-            // transparent windows and doubled it where it did.
-            const opacity = typeof state.config.overlayOpacity === 'number'
-                ? state.config.overlayOpacity : 1.0;
-            const itemNames = {};
-            for (const it of itemData.getItemList?.() || []) if (it?.id && it?.name) itemNames[it.id] = it.name;
-            state.overlayWindow.webContents.send('overlay-init', {
-                itemNames,
-                ddragonVersion: championData.getLatestVersion(),
-                champKeyMap: championData.getNameToKeyMap(),
-                showRanked:  state.config.overlayShowRanked  !== false,
-                showBuilds:  state.config.overlayShowBuilds  !== false,
-                opacity,
-                hotkey:  state.config.overlayHotkey  || 'Ctrl+Shift+H',
-                locked:  state.config.overlayLocked  || false,
-                csGoal:  state.config.overlayCsGoal  || 8,
-            });
-        };
-        state.overlayWindow.webContents.on('did-finish-load', () => {
-            sendInit();
-            // Started during a game: champion keys and item names may still be
-            // loading; send them again once they are there.
-            require('./services/item-data').whenReady().then(sendInit).catch(() => {});
-        });
-    };
-
-    // viaOverwolf: an Overwolf overlay window is drawn only inside the game
-    // it was injected into; the fallback is a plain window on top of it.
-    const done = (rawWin, viaOverwolf) => {
-        finish(rawWin);
-        state.overlayViaOverwolf = viaOverwolf;
-        if (onReady) onReady();
-    };
-    const fallback = () => {
-        // 'toolbar' keeps it out of Alt+Tab and the taskbar.
-        const fb = new BrowserWindow({ ...opts, type: 'toolbar' });
-        fb.setAlwaysOnTop(true, 'screen-saver');
-        done(fb, false);
-    };
-    if (owOverlay) {
-        owOverlay.createWindow(opts)
-            .then((w) => done(w, true))
-            .catch(e => {
-                console.error('[Overlay] createWindow failed, using BrowserWindow fallback:', e.message);
-                fallback();
-            });
-    } else {
-        fallback();
-    }
+function showMainWindow() {
+    const win = state.mainWindow;
+    if (!win || win.isDestroyed()) return;
+    win.show();
+    if (win.isMinimized?.()) win.restore();
+    win.focus?.();
 }
 
 // Built when the menu opens, so it always matches the vault state and the
@@ -167,7 +64,6 @@ function createOverlayWindow(owOverlay, onReady = null) {
 // vault is locked it names no accounts; the launch itself (launchFromOutside)
 // shows the window, or keeps it hidden for minimize-on-launch accounts.
 function buildTrayMenu() {
-    const showMain = () => { if (state.mainWindow) { state.mainWindow.show(); state.mainWindow.focus(); } };
     let acctItems;
     if (launchModule().isVaultLocked()) {
         acctItems = [{ label: 'Unlock to see your accounts', enabled: false }];
@@ -180,11 +76,11 @@ function buildTrayMenu() {
     }
 
     return Menu.buildFromTemplate([
-        { label: 'Lost League Manager', enabled: false },
+        { label: 'League Account Launcher', enabled: false },
         { type: 'separator' },
         ...acctItems,
         { type: 'separator' },
-        { label: 'Open', click: showMain },
+        { label: 'Open', click: showMainWindow },
         { type: 'separator' },
         { label: 'Quit', click: () => { app.isQuiting = true; app.quit(); } },
     ]);
@@ -193,12 +89,9 @@ function buildTrayMenu() {
 function createTray() {
     const iconPath = path.join(__dirname, '../renderer/assets/logo.ico');
     state.tray = new Tray(iconPath);
-    state.tray.setToolTip('Lost League Manager');
-    const showMain = () => {
-        if (state.mainWindow) { state.mainWindow.show(); state.mainWindow.focus(); }
-    };
-    state.tray.on('click',        showMain);
-    state.tray.on('double-click', showMain);
+    state.tray.setToolTip('League Account Launcher');
+    state.tray.on('click', showMainWindow);
+    state.tray.on('double-click', showMainWindow);
     state.tray.on('right-click',  () => state.tray.popUpContextMenu(buildTrayMenu()));
 }
 
@@ -210,11 +103,9 @@ function updateJumpList() {
     const accounts = require('./services/vault').isVaultEnabled() ? [] : loadAccounts();
 
     const tasks = accounts.slice(0, 5).map(acc => {
-        let args = `--launch=${acc.username}`;
-        if (!app.isPackaged) args = `. --launch=${acc.username}`;
         return {
             program: process.execPath,
-            arguments: args,
+            arguments: accountLaunchArguments(acc.username),
             iconPath: process.execPath,
             iconIndex: 0,
             title: `Launch ${acc.label || acc.username}`,
@@ -238,7 +129,7 @@ function broadcastAccountsUpdate() {
 
 module.exports = {
     createMainWindow,
-    createOverlayWindow,
+    showMainWindow,
     createTray,
     buildTrayMenu,
     updateJumpList,

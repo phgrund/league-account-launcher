@@ -4,7 +4,6 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const state = require('../src/main/state');
 const vault = require('../src/main/services/vault');
-const { encrypt } = require('../src/main/services/encryption');
 require('../src/main/ipc/accounts').register();
 require('../src/main/ipc/config').register();
 
@@ -32,7 +31,7 @@ async function scryptVault(password) {
 
 test.beforeEach(() => {
     resetVault();
-    writeJson('accounts.json', [{ username: 'main', password: encrypt('secret-pw'), notes: 'private' }]);
+    writeJson('accounts.json', [{ username: 'main', password: 'secret-pw', notes: 'private' }]);
     fakeElectron.dialog.showOpenDialog = async () => { throw new Error('dialog must not open while locked'); };
     fakeElectron.dialog.showSaveDialog = async () => { throw new Error('dialog must not open while locked'); };
 });
@@ -43,7 +42,6 @@ test('set-config cannot switch the vault off or re-key it while locked', async (
     assert.equal(res.success, false);
     assert.equal(vault.isVaultLocked(), true);
     assert.equal(state.config.vaultPasswordHash, legacy.sha256('summer1'));
-    assert.equal(await invoke('get-account-password', 'main'), null);
 });
 
 test('get-config never returns the vault verifier', async () => {
@@ -152,17 +150,14 @@ test('while locked, account IPC refuses and changes nothing', async () => {
     const locked = { success: false, locked: true, message: 'Vault is locked' };
 
     assert.deepEqual(await invoke('get-accounts'), []);
-    assert.equal(await invoke('get-account-password', 'main'), null);
-    assert.deepEqual(await invoke('add-account', { username: 'x', password: 'y' }), locked);
-    assert.deepEqual(await invoke('update-account', { username: 'main', password: 'changed' }), locked);
+    assert.deepEqual(await invoke('capture-account', { label: 'x' }), locked);
+    assert.deepEqual(await invoke('update-account', { username: 'main', label: 'changed' }), locked);
     assert.deepEqual(await invoke('delete-account', 'main'), locked);
-    assert.deepEqual(await invoke('reorder-accounts', ['main']), locked);
     assert.deepEqual(await invoke('export-accounts', 'long enough passphrase'), locked);
     assert.deepEqual(await invoke('import-accounts', {}), locked);
     assert.equal(fs.readFileSync(file('accounts.json'), 'utf8'), before);
 
     assert.equal((await invoke('unlock-vault', 'summer1')).success, true);
-    assert.equal(await invoke('get-account-password', 'main'), 'secret-pw');
     assert.equal((await invoke('get-accounts')).length, 1);
 });
 

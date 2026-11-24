@@ -1,49 +1,39 @@
 {
-  "name": "leaguelogin",
-  "version": "1.13.1",
-  "description": "Lost League Manager",
+  "name": "league-account-launcher",
+  "productName": "League Account Launcher",
+  "version": "0.0.1",
+  "description": "League of Legends account launcher",
   "main": "src/main/main.js",
   "scripts": {
-    "start": "ow-electron .",
-    "build": "ow-electron-builder",
+    "start": "electron .",
+    "build": "electron-builder --publish never",
     "test": "node --test \"test/**/*.test.js\""
   },
-  "author": "Lostgames",
+  "engines": {
+    "node": ">=22.12.0"
+  },
   "license": "ISC",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/MouseWerk/lost-league-manager.git"
-  },
-  "dependencies": {
-    "@xhayper/discord-rpc": "^1.3.4",
-    "axios": "^1.13.2",
-    "electron-updater": "^6.7.3",
-    "js-yaml": "^4.1.1",
-    "ws": "^8.19.0"
-  },
   "devDependencies": {
-    "@overwolf/ow-electron": "^37.7.0",
-    "@overwolf/ow-electron-builder": "^26.0.12"
-  },
-  "overwolf": {
-    "packages": [
-      "gep",
-      "overlay"
-    ]
+    "electron": "45.4.1",
+    "electron-builder": "26.18.0"
   },
   "build": {
-    "appId": "com.lostgames.leaguelogin",
-    "productName": "Lost League Manager",
+    "appId": "com.leagueaccountlauncher.app",
+    "artifactName": "League-Account-Launcher-Setup-${version}.${ext}",
     "directories": {
       "output": "dist"
     },
     "files": [
-      "**/*",
-      "!test/**",
-      "!docs/**"
+      "src/**/*",
+      "package.json",
+      "LICENSE"
     ],
     "extraResources": [
-      "resources/**"
+      {
+        "from": "resources/scripts",
+        "to": "resources/scripts",
+        "filter": ["login.ps1"]
+      }
     ],
     "win": {
       "target": "nsis",
@@ -53,14 +43,9 @@
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true
-    },
-    "publish": [
-      {
-        "provider": "github",
-        "owner": "MouseWerk",
-        "repo": "lost-league-manager",
-        "releaseType": "release"
-      }
-    ]
+    }
+  },
+  "dependencies": {
+    "js-yaml": "^4.1.1"
   }
 }

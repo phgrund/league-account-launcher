@@ -11,6 +11,9 @@ const path = require('path');
 // safeStorage: reversible, but the ciphertext never contains the plaintext.
 const safe = { available: true };
 fakeElectron.safeStorage = {
+    isAsyncEncryptionAvailable: async () => safe.available,
+    encryptStringAsync: async (s) => fakeElectron.safeStorage.encryptString(s),
+    decryptStringAsync: async (buf) => ({ result: fakeElectron.safeStorage.decryptString(buf) }),
     isEncryptionAvailable: () => safe.available,
     encryptString: (s) => {
         if (!safe.available) throw new Error('Encryption is not available');

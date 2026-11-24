@@ -1,16 +1,14 @@
-const { invoke, fakeElectron, machine, userData, file, writeJson, readJson, legacy } = require('./helpers/b-fakes');
+const { invoke, fakeElectron, safe, userData, file, writeJson, readJson, legacy } = require('./helpers/b-fakes');
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
 const state = require('../src/main/state');
 const encryption = require('../src/main/services/encryption');
-const { encrypt, decrypt } = encryption;
-const { recordHonorLevel, loadHonorWatch } = require('../src/main/services/honor-watch');
 require('../src/main/ipc/accounts').register();
 
 const PASS = 'correct horse battery';
-const backupPath = path.join(userData, 'backup.llem');
+const backupPath = path.join(userData, 'backup.lalbackup');
 
 function chooseSave(filePath) {
     fakeElectron.dialog.showSaveDialog = async () => ({ canceled: false, filePath });
@@ -23,21 +21,17 @@ function chooseOpen(filePath) {
 
 test.beforeEach(() => {
     state.config.vaultEnabled = false;
-    state.currentAccount = null;
-    machine.regFails = false;
-    encryption._resetKeyCache();
     openCalls = 0;
     writeJson('accounts.json', []);
-    writeJson('honor-watch.json', {});
     fs.rmSync(backupPath, { force: true });
 });
 
-// ── Backups ───────────────────────────────────────────────────────────────────
 
 test('backup v2 round-trips only with its passphrase, and each export has its own salt', async () => {
-    const data = { version: 1, accounts: [{ username: 'ü', password: 'plain-text-pw' }] };
+    const data = { version: 1, accounts: [{ username: '\u03bb', password: 'plain-text-pw' }] };
     const a = await encryption.encryptExport(data, PASS);
     const b = await encryption.encryptExport(data, PASS);
+    assert.equal(JSON.parse(a).format, 'league-account-backup');
     assert.notEqual(JSON.parse(a).kdf.salt, JSON.parse(b).kdf.salt);
     assert.equal(a.includes('plain-text-pw'), false);
     assert.deepEqual((await encryption.decryptExport(a, PASS)).data, data);
@@ -56,14 +50,17 @@ test('export needs a passphrase of at least 8 characters, not trimmed', async ()
     assert.equal(fs.existsSync(backupPath), true);
 });
 
-test('export then import with the passphrase restores accounts; the file holds no readable password', async () => {
+test('export then import with the passphrase restores accounts; old passwords are left out', async () => {
     writeJson('accounts.json', [
-        { username: 'main', password: encrypt('s3cret-pw'), label: 'Main', notes: 'n', _cachedStats: { tier: 'Gold' }, lastUsed: 5 },
+        { username: 'main', password: 's3cret-pw', encryptedPassword: 'local-only', label: 'Main', notes: 'n', _cachedStats: { tier: 'Gold' }, lastUsed: 5 },
     ]);
     chooseSave(backupPath);
     const exp = await invoke('export-accounts', PASS);
-    assert.deepEqual(exp, { success: true, count: 1, unreadable: 0 });
-    assert.equal(fs.readFileSync(backupPath, 'utf8').includes('s3cret-pw'), false);
+    assert.deepEqual(exp, { success: true, count: 1 });
+    const backup = await encryption.decryptExport(fs.readFileSync(backupPath, 'utf8'), PASS);
+    assert.equal(backup.ok, true);
+    assert.equal('password' in backup.data.accounts[0], false);
+    assert.equal('encryptedPassword' in backup.data.accounts[0], false);
 
     writeJson('accounts.json', []);
     chooseOpen(backupPath);
@@ -81,7 +78,7 @@ test('export then import with the passphrase restores accounts; the file holds n
     const [acc] = readJson('accounts.json');
     assert.equal(acc.username, 'main');
     assert.equal(acc.label, 'Main');
-    assert.equal(decrypt(acc.password), 's3cret-pw');
+    assert.equal('password' in acc, false);
     assert.equal('_cachedStats' in acc, false);
     assert.equal('lastUsed' in acc, false);
 });
@@ -92,14 +89,14 @@ test('old fixed-key backups still import without a passphrase', async () => {
     const res = await invoke('import-accounts');
     assert.equal(res.success, true);
     assert.equal(res.added, 1);
-    assert.equal(decrypt(readJson('accounts.json')[0].password), 'pw1');
+    assert.equal('password' in readJson('accounts.json')[0], false);
 });
 
 test('import validates entries, copies only known fields and reports skips', async () => {
-    writeJson('accounts.json', [{ username: 'Existing', password: encrypt('x') }]);
+    writeJson('accounts.json', [{ username: 'Existing', password: 'x' }]);
     fs.writeFileSync(backupPath, legacy.exportV1({ version: 1, accounts: [
         { username: 123, password: 'x' },
-        { username: 'a', password: {} },
+        { username: 'a', label: {} },
         null,
         { username: 'existing', password: 'dup' },
         { username: 'good', password: 'b', _cachedStats: { tier: '<img src=x>' }, honorFlagged: true, extra: 1 },
@@ -131,27 +128,6 @@ test('a huge file is not read', async () => {
     assert.match(res.message, /too large/);
 });
 
-test('an account with an unreadable password survives export and import with its details', async () => {
-    writeJson('accounts.json', [
-        { username: 'broken', password: 'v2:00:00', label: 'Smurf', riotId: 'Smurf#EUW' },
-        { username: 'fine', password: encrypt('ok') },
-    ]);
-    chooseSave(backupPath);
-    const exp = await invoke('export-accounts', PASS);
-    assert.equal(exp.unreadable, 1);
-
-    writeJson('accounts.json', []);
-    chooseOpen(backupPath);
-    await invoke('import-accounts');
-    const res = await invoke('import-accounts', { passphrase: PASS });
-    assert.equal(res.added, 2);
-    assert.equal(res.withoutPassword, 1);
-    const accounts = await invoke('get-accounts');
-    const broken = accounts.find(a => a.username === 'broken');
-    assert.equal(broken.label, 'Smurf');
-    assert.equal(broken.passwordOk, false);
-});
-
 test('an export that cannot be written reports the error', async () => {
     chooseSave(path.join(userData, 'no-such-dir', 'x.llem'));
     const res = await invoke('export-accounts', PASS);
@@ -159,112 +135,64 @@ test('an export that cannot be written reports the error', async () => {
     assert.ok(res.message);
 });
 
-test('without the machine key an import saves nothing and says why', async () => {
-    fs.writeFileSync(backupPath, legacy.exportV1({ version: 1, accounts: [{ username: 'a', password: 'b' }] }));
-    chooseOpen(backupPath);
-    machine.regFails = true;
-    const res = await invoke('import-accounts');
-    assert.equal(res.success, false);
-    assert.match(res.message, /machine key/);
-    assert.deepEqual(readJson('accounts.json'), []);
-});
-
-// ── Account handlers ──────────────────────────────────────────────────────────
-
-test('add-account reports a missing machine key instead of throwing', async () => {
-    machine.regFails = true;
-    const res = await invoke('add-account', { username: 'a', password: 'b' });
-    assert.equal(res.success, false);
-    assert.match(res.message, /machine key/);
-});
-
-test('add-account rejects missing passwords and wrong field types', async () => {
-    assert.equal((await invoke('add-account', { username: 'a' })).success, false);
-    assert.equal((await invoke('add-account', { username: '  ', password: 'b' })).success, false);
-    assert.equal((await invoke('add-account', { username: 'a', password: 'b', notes: { x: 1 } })).success, false);
-    assert.equal((await invoke('add-account', { username: 'a', password: 'b', _cachedStats: {} })).success, true);
-    assert.equal('_cachedStats' in readJson('accounts.json')[0], false);
-});
-
-test('usernames match case-insensitively for update, delete, password and reorder', async () => {
+test('usernames match case-insensitively for updates and deletes', async () => {
     writeJson('accounts.json', [
-        { username: 'Player1', password: encrypt('one') },
-        { username: 'Second', password: encrypt('two') },
+        { username: 'Player1', password: 'one' },
+        { username: 'Second', password: 'two' },
     ]);
     assert.equal((await invoke('update-account', { username: 'player1', label: 'L' })).success, true);
     assert.equal(readJson('accounts.json')[0].label, 'L');
-    assert.equal(await invoke('get-account-password', 'PLAYER1'), 'one');
-    assert.equal((await invoke('reorder-accounts', ['second', 'player1'])).success, true);
-    assert.deepEqual(readJson('accounts.json').map(a => a.username), ['Second', 'Player1']);
+    assert.equal(readJson('accounts.json')[0].username, 'Player1');
     assert.equal((await invoke('delete-account', 'player1')).success, true);
     assert.deepEqual(readJson('accounts.json').map(a => a.username), ['Second']);
 });
 
-test('delete-account: unknown name fails, honor flag and active account are cleared', async () => {
-    writeJson('accounts.json', [{ username: 'Main', password: encrypt('x') }]);
-    recordHonorLevel('Main', 4);
-    recordHonorLevel('Main', 2);
-    state.currentAccount = { username: 'main' };
-
+test('account data sent to the renderer omits passwords and retired fields', async () => {
+    writeJson('accounts.json', [{
+        username: 'Main', label: 'Primary', password: 'x',
+        appearOffline: true, autoSkinRandom: true, _cachedStats: { tier: 'Gold' },
+    }]);
+    const [account] = await invoke('get-accounts');
+    assert.equal(account.label, 'Primary');
+    assert.equal(account.savedSignIn, false);
+    for (const key of ['password', 'appearOffline', 'autoSkinRandom', '_cachedStats']) {
+        assert.equal(key in account, false, key);
+    }
     assert.equal((await invoke('delete-account', 'ghost')).success, false);
-    assert.equal((await invoke('delete-account', 'Main')).success, true);
-    assert.deepEqual(loadHonorWatch(), {});
-    assert.equal(state.currentAccount, null);
 });
 
-test('honor records written under another spelling of the username are found', async () => {
-    writeJson('honor-watch.json', { Main: { peak: 4, current: 2, updatedAt: 1 } });
-    writeJson('accounts.json', [{ username: 'main', password: encrypt('x') }]);
-    const [acc] = await invoke('get-accounts');
-    assert.equal(acc.honorFlagged, true);
+test('a saved Riot password is encrypted locally and stays out of account IPC results', async () => {
+    const password = 'example password';
+    const result = await invoke('add-account', { username: 'local', password });
+    assert.equal(result.success, true);
+    const [saved] = readJson('accounts.json');
+    assert.equal('password' in saved, false);
+    assert.equal(saved.encryptedPassword.includes(password), false);
+    const { result: decrypted } = await fakeElectron.safeStorage.decryptStringAsync(Buffer.from(saved.encryptedPassword, 'base64'));
+    assert.equal(decrypted, password);
+    const [account] = await invoke('get-accounts');
+    assert.equal(account.hasSavedPassword, true);
+    assert.equal('encryptedPassword' in account, false);
 });
 
-test('a reorder that cannot be saved reports the error', async (t) => {
-    writeJson('accounts.json', [{ username: 'a', password: '' }, { username: 'b', password: '' }]);
-    t.mock.method(fs, 'openSync', () => { throw Object.assign(new Error('EBUSY: resource busy'), { code: 'EBUSY' }); });
-    const res = await invoke('reorder-accounts', ['b', 'a']);
-    assert.equal(res.success, false);
-    assert.match(res.message, /EBUSY/);
-});
+test('replacing a Riot password requires Windows encryption and removes the old format on success', async t => {
+    writeJson('accounts.json', [{ username: 'local', password: 'legacy-encrypted' }]);
+    safe.available = false;
+    t.after(() => { safe.available = true; });
+    assert.equal((await invoke('update-account', { username: 'local', password: 'new secret' })).success, false);
+    assert.equal(readJson('accounts.json')[0].password, 'legacy-encrypted');
 
-test('the goal rank is saved with the account and capped in length', async () => {
-    await invoke('add-account', { username: 'goal-test', password: 'pw', goalRank: 'DIAMOND IV' });
-    assert.equal(readJson('accounts.json').find(a => a.username === 'goal-test').goalRank, 'DIAMOND IV');
-    await invoke('update-account', { username: 'goal-test', goalRank: 'x'.repeat(100) });
-    assert.equal(readJson('accounts.json').find(a => a.username === 'goal-test').goalRank, 'DIAMOND IV');
-});
-
-test('tags are cleaned up before they are stored', async () => {
-    await invoke('add-account', { username: 'tag-test', password: 'pw', tags: '  Main ,duo,  DUO, ,Smurf   one  ' });
-    const stored = () => readJson('accounts.json').find(a => a.username === 'tag-test').tags;
-    assert.equal(stored(), 'Main, duo, Smurf one');
-    await invoke('update-account', { username: 'tag-test', tags: Array.from({ length: 12 }, (_, i) => `t${i}`).join(',') });
-    assert.equal(stored().split(', ').length, 8);
-    await invoke('update-account', { username: 'tag-test', tags: 'x'.repeat(40) });
-    assert.equal(stored(), 'x'.repeat(24));
-    await invoke('update-account', { username: 'tag-test', tags: 7 });
-    assert.equal(stored(), 'x'.repeat(24));
-});
-
-test('deleting the last account with a Riot ID forgets its games and rank history', async () => {
-    const matches = require('../src/main/services/matches');
-    const { getRankHistory, recordRankSnapshot } = require('../src/main/services/rank-history');
-    await invoke('add-account', { username: 'one', password: 'pw', riotId: 'Shared#EUW' });
-    await invoke('add-account', { username: 'two', password: 'pw', riotId: 'Shared#EUW' });
-    matches.mergeMatches('Shared#EUW', [{ id: 'm1', createdAt: 1, champion: 'Ahri' }]);
-    recordRankSnapshot('Shared#EUW', 'GOLD', 'II', 50, 'lcu');
-    await invoke('delete-account', 'one');
-    assert.equal(matches.getStoredMatches('Shared#EUW').length, 1, 'another account still uses it');
-    await invoke('delete-account', 'two');
-    assert.equal(matches.getStoredMatches('Shared#EUW').length, 0);
-    assert.deepEqual(getRankHistory('Shared#EUW'), []);
+    safe.available = true;
+    assert.equal((await invoke('update-account', { username: 'local', password: 'new secret' })).success, true);
+    assert.equal('password' in readJson('accounts.json')[0], false);
+    assert.equal((await invoke('get-accounts'))[0].hasSavedPassword, true);
 });
 
 test('export can be limited to the selected accounts', async () => {
     writeJson('accounts.json', [
-        { username: 'one', password: encrypt('a-pw') },
-        { username: 'two', password: encrypt('b-pw') },
-        { username: 'three', password: encrypt('c-pw') },
+        { username: 'one', password: 'a-pw' },
+        { username: 'two', password: 'b-pw' },
+        { username: 'three', password: 'c-pw' },
     ]);
     chooseSave(backupPath);
     const res = await invoke('export-accounts', PASS, ['TWO', 'three']);

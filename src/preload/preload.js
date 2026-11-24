@@ -1,111 +1,30 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
-contextBridge.exposeInMainWorld('electronAPI', {
-    closeWindow: () => ipcRenderer.invoke('window-control', 'close'),
-    minimizeWindow: () => ipcRenderer.invoke('window-control', 'minimize'),
-
+contextBridge.exposeInMainWorld('launcher', {
     getAccounts: () => ipcRenderer.invoke('get-accounts'),
-    addAccount: (data) => ipcRenderer.invoke('add-account', data),
-    updateAccount: (data) => ipcRenderer.invoke('update-account', data),
-    deleteAccount: (username) => ipcRenderer.invoke('delete-account', username),
-
-    // getConfig returns no secrets: riotApiKeySet and vaultEnabled instead.
-    getConfig: () => ipcRenderer.invoke('get-config'),
-    setConfig: (config) => ipcRenderer.invoke('set-config', config),
-    setRiotApiKey: (key) => ipcRenderer.invoke('set-riot-api-key', key),
-    setHenrikKey: (key) => ipcRenderer.invoke('set-henrik-key', key),
-
-    // Valorant (same Riot accounts; data from the last sign-in)
-    valorantAccount: (username) => ipcRenderer.invoke('valorant-account', username),
-    valorantRefresh: (username) => ipcRenderer.invoke('valorant-refresh', username),
-    valorantLoadout: (username) => ipcRenderer.invoke('valorant-loadout', username),
-    valorantEquip: (username, guns) => ipcRenderer.invoke('valorant-equip', { username, guns }),
-    valorantSaveSet: (username, set) => ipcRenderer.invoke('valorant-save-set', { username, set }),
-    valorantDeleteSet: (username, id) => ipcRenderer.invoke('valorant-delete-set', { username, id }),
-
-    launchAccount: (username, opts) => ipcRenderer.invoke('launch-account', username, opts),
-    launchLeagueClient: () => ipcRenderer.invoke('launch-league-client'),
+    captureAccount: details => ipcRenderer.invoke('capture-account', details),
+    addAccount: details => ipcRenderer.invoke('add-account', details),
+    updateAccount: account => ipcRenderer.invoke('update-account', account),
+    deleteAccount: username => ipcRenderer.invoke('delete-account', username),
+    createShortcut: username => ipcRenderer.invoke('create-account-shortcut', username),
+    exportAccounts: password => ipcRenderer.invoke('export-accounts', password),
+    importAccounts: password => ipcRenderer.invoke('import-accounts', password === undefined ? undefined : { passphrase: password }),
+    launch: (username, options) => ipcRenderer.invoke('launch-account', username, options),
     cancelLaunch: () => ipcRenderer.invoke('cancel-launch'),
-    getStats: (region, riotId, force = false) => ipcRenderer.invoke('get-stats', { region, riotId, force }),
-    lookupSummoner: (input, region) => ipcRenderer.invoke('lookup-summoner', { input, region }),
-    getClientSummoner: () => ipcRenderer.invoke('get-client-summoner'),
-    getMatchHistory: (region, riotId) => ipcRenderer.invoke('get-match-history', { region, riotId }),
-    getChampBuild: (position) => ipcRenderer.invoke('get-champ-build', { position }),
-    getMatchup: (opponentKey, position) => ipcRenderer.invoke('get-matchup', { opponentKey, position }),
-    getDuoSynergy: () => ipcRenderer.invoke('get-duo-synergy'),
-    importChampBuild: (opts) => ipcRenderer.invoke('import-champ-build', opts),
-    onBuildImported: (callback) => ipcRenderer.on('build-imported', (event, data) => callback(data)),
-    onUnknownAccount: (callback) => ipcRenderer.on('unknown-account-signed-in', (event, data) => callback(data)),
-    onRiotIdChanged: (callback) => ipcRenderer.on('riot-id-changed', (event, data) => callback(data)),
-    getSession: () => ipcRenderer.invoke('get-session'),
-    getSeasonReview: (region, riotId) => ipcRenderer.invoke('get-season-review', { region, riotId }),
-    getAllRankHistory: () => ipcRenderer.invoke('get-all-rank-history'),
-    getStoredMatches: (riotId) => ipcRenderer.invoke('get-stored-matches', riotId),
-    getCollection: (username) => ipcRenderer.invoke('get-collection', username),
-    getMatchDetail: (region, riotId, matchId) => ipcRenderer.invoke('get-match-detail', { region, riotId, matchId }),
-    getRankHistory: (riotId) => ipcRenderer.invoke('get-rank-history', riotId),
-
-    acceptMatch: () => ipcRenderer.invoke('accept-match'),
-
-    changeLanguage: (locale) => ipcRenderer.invoke('change-language', locale),
-    dodgeQueue: () => ipcRenderer.invoke('dodge-queue'),
-
-    fixClient: () => ipcRenderer.invoke('fix-client'),
-    repairClient: () => ipcRenderer.invoke('repair-client'),
-    clearClientCache: () => ipcRenderer.invoke('clear-client-cache'),
-    openDataFolder: () => ipcRenderer.invoke('open-data-folder'),
-
-    reorderAccounts: (usernames) => ipcRenderer.invoke('reorder-accounts', usernames),
-    // Vault: the plaintext password goes to the main process, which checks it.
-    unlockVault: (password) => ipcRenderer.invoke('unlock-vault', password),
+    getConfig: () => ipcRenderer.invoke('get-config'),
+    chooseLeaguePath: () => ipcRenderer.invoke('choose-league-path'),
+    setConfig: settings => ipcRenderer.invoke('set-config', settings),
     getVaultState: () => ipcRenderer.invoke('get-vault-state'),
-    setVaultPassword: ({ current, next } = {}) => ipcRenderer.invoke('set-vault-password', { current, next }),
-    disableVault: (current) => ipcRenderer.invoke('disable-vault', current),
-    getAccountPassword: (username) => ipcRenderer.invoke('get-account-password', username),
-    exportAccounts: (passphrase, usernames = null) => ipcRenderer.invoke('export-accounts', passphrase, usernames),
-    importAccounts: ({ passphrase } = {}) => ipcRenderer.invoke('import-accounts', { passphrase }),
-    openFileDialog: (options) => ipcRenderer.invoke('open-file-dialog', options),
-    getCurrentAccount: () => ipcRenderer.invoke('get-current-account'),
-    getLcuOverview: () => ipcRenderer.invoke('get-lcu-overview'),
-    onLcuConnected:    (cb) => ipcRenderer.on('lcu-connected',    () => cb()),
-    onLcuDisconnected: (cb) => ipcRenderer.on('lcu-disconnected', () => cb()),
-    onLcuGameflow:     (cb) => ipcRenderer.on('lcu-gameflow',  (_, phase) => cb(phase)),
-
-    onChampSelectUpdate: (callback) => ipcRenderer.on('champ-select-update', (event, data) => callback(data)),
-    onChampSelectEnd: (callback) => ipcRenderer.on('champ-select-end', () => callback()),
-    onLoginStatus: (callback) => ipcRenderer.on('login-status', (event, data) => callback(data)),
-    onAccountsUpdated: (callback) => ipcRenderer.on('accounts-updated', () => callback()),
-    onDataFileProblem: (callback) => ipcRenderer.on('data-file-problem', (event, message) => callback(message)),
-    onLaunchAccountInfo: (callback) => ipcRenderer.on('launch-account-info', (event, data) => callback(data)),
-
-    resetOverlayPosition: () => ipcRenderer.invoke('overlay-reset-position'),
-
-    // Updates
-    checkForUpdates: () => ipcRenderer.invoke('check-for-updates'),
-    installUpdate: () => ipcRenderer.invoke('install-update'),
-    getVersion: () => ipcRenderer.invoke('get-version'),
-    onUpdateAvailable: (callback) => ipcRenderer.on('update-available', (event, data) => callback(data)),
-    onUpdateProgress: (callback) => ipcRenderer.on('update-progress', (event, data) => callback(data)),
-    onUpdateDownloaded: (callback) => ipcRenderer.on('update-downloaded', (event, data) => callback(data)),
-    onUpdateError: (callback) => ipcRenderer.on('update-error', (event, message) => callback(message)),
-
-    // Overwolf GEP (Game Events Provider)
-    onGepGameEvent: (callback) => ipcRenderer.on('gep-game-event', (event, data) => callback(data)),
-    onGepInfoUpdate: (callback) => ipcRenderer.on('gep-info-update', (event, data) => callback(data)),
-
-    // Dodge info (queue type + active penalty) — call before confirming a dodge
-    getDodgeInfo: () => ipcRenderer.invoke('get-dodge-info'),
-
-    openExternal:   (url) => ipcRenderer.invoke('open-external', url),
-    openOpgg:       (region, riotId) => ipcRenderer.invoke('open-opgg', region, riotId),
-    openOpggMultisearch: (region, riotIds) => ipcRenderer.invoke('open-opgg-multisearch', region, riotIds),
-    getLobbyCheck:  () => ipcRenderer.invoke('get-lobby-check'),
-    openPatchNotes: () => ipcRenderer.invoke('open-patch-notes'),
-    getChampionList: () => ipcRenderer.invoke('get-champion-list'),
-    getChampionFullData: (champKey) => ipcRenderer.invoke('get-champion-full-data', champKey),
-    getItemList: () => ipcRenderer.invoke('get-item-list'),
-    setZoomFactor: (factor) => ipcRenderer.invoke('set-zoom-factor', factor),
-
-    // Fired when LCU connect reveals which account is logged in externally
-    onActiveAccountDetected: (cb) => ipcRenderer.on('active-account-detected', (_, username) => cb(username)),
+    unlockVault: password => ipcRenderer.invoke('unlock-vault', password),
+    setVaultPassword: passwords => ipcRenderer.invoke('set-vault-password', passwords),
+    disableVault: password => ipcRenderer.invoke('disable-vault', password),
+    onAccountsUpdated(callback) {
+        ipcRenderer.on('accounts-updated', () => callback());
+    },
+    onLoginStatus(callback) {
+        ipcRenderer.on('login-status', (event, status) => callback(status));
+    },
+    onDataFileProblem(callback) {
+        ipcRenderer.on('data-file-problem', (event, message) => callback(message));
+    },
 });

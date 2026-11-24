@@ -1,29 +1,11 @@
-const accounts       = require('./accounts');
-const launch         = require('./launch');
-const stats          = require('./stats');
-const overlayHandlers = require('./overlay-handlers');
-const clientControls = require('./client-controls');
-const config         = require('./config');
-const updater        = require('./updater');
-const lolData        = require('./lol-data');
-const lobbyCheck     = require('./lobby-check');
-const champBuild     = require('./champ-build');
-const session        = require('./session');
-const valorant       = require('./valorant');
+const accounts = require('./accounts');
+const launch = require('./launch');
+const config = require('./config');
 
 function registerAll() {
     accounts.register();
     launch.register();
-    stats.register();
-    overlayHandlers.register();
-    clientControls.register();
     config.register();
-    updater.register();
-    lolData.register();
-    lobbyCheck.register();
-    champBuild.register();
-    session.register();
-    valorant.register();
 }
 
 module.exports = { registerAll };

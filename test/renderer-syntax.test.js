@@ -5,6 +5,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
+const vm = require('node:vm');
 
 const dir = path.join(__dirname, '..', 'src', 'renderer', 'js');
 
@@ -15,8 +16,36 @@ for (const file of fs.readdirSync(dir).filter((f) => f.endsWith('.js'))) {
     });
 }
 
-test('the warning badges are redrawn when the rank arrives', () => {
-    const app = fs.readFileSync(path.join(dir, 'app.js'), 'utf8');
-    const fn = app.slice(app.indexOf('function applyStatsToCard'), app.indexOf('\n}\n', app.indexOf('function applyStatsToCard')));
-    assert.match(fn, /statusWarnings\(acc\.status, stats\?\.tier/);
+test('the renderer starts with the launcher API exposed as an immutable window property', async () => {
+    const html = fs.readFileSync(path.join(dir, '..', 'index.html'), 'utf8');
+    const elements = new Map([...html.matchAll(/<[^>]*\bid="([^"]+)"[^>]*>/g)].map(([tag, id]) => [id, {
+        hidden: /\shidden(?:\s|>)/.test(tag),
+        disabled: /\sdisabled(?:\s|>)/.test(tag),
+        addEventListener() {},
+        querySelector() { return this; },
+        replaceChildren() {},
+    }]));
+    const api = {
+        onLoginStatus() {},
+        onDataFileProblem() {},
+        onAccountsUpdated() {},
+        getVaultState: async () => ({ unlocked: true }),
+        getAccounts: async () => [],
+    };
+    const document = {
+        getElementById: id => elements.get(id),
+        querySelectorAll: () => [],
+    };
+    const context = vm.createContext({ document, api });
+    vm.runInContext(`
+        globalThis.window = globalThis;
+        Object.defineProperty(window, 'launcher', { value: api });
+    `, context);
+
+    const script = fs.readFileSync(path.join(dir, 'app.js'), 'utf8');
+    await vm.runInContext(script, context);
+
+    assert.equal(elements.get('accounts-view').hidden, false);
+    assert.equal(elements.get('empty').hidden, false);
+    assert.equal(elements.get('open-settings').disabled, false);
 });

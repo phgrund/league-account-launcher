@@ -2,12 +2,11 @@ const fx = require('./helpers/a-fakes');
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
-const http = require('http');
+const { mockLocalHttp } = require('./helpers/local-http');
 const os = require('os');
 const path = require('path');
 const state = require('../src/main/state');
 const lcu = require('../src/main/lcu');
-const { encrypt } = require('../src/main/services/encryption');
 const launch = require('../src/main/ipc/launch');
 
 launch.register();
@@ -32,24 +31,21 @@ function setup({ accounts, lcuConnected = false, session = null, phase = 'None',
     win = fx.fakeWindow({ visible });
     state.mainWindow = win;
     fx.writeAccounts(accounts || [
-        { username: 'alice', password: encrypt('pw-a') },
-        { username: 'bob', password: encrypt('pw-b') },
+        { username: 'alice', password: 'pw-a' },
+        { username: 'bob', password: 'pw-b' },
     ]);
     lcu.connected = lcuConnected;
     lcu.request = async (method, endpoint) => {
+        if (!lcu.connected) return null;
         if (endpoint === '/lol-login/v1/session') return typeof session === 'function' ? session() : session;
         if (endpoint === '/lol-gameflow/v1/gameflow-phase') return phase;
         return null;
     };
 }
 
-// Starts a launch and returns its login script once it has been spawned.
-async function startUntilScript(username, opts) {
-    const res = await launch.executeAccountLaunch(username, opts);
-    assert.equal(res.success, true, `launch of ${username} should start: ${JSON.stringify(res)}`);
-    const script = fx.loginScripts().at(-1);
-    assert.ok(script, 'login script spawned');
-    return script;
+async function startLaunch(username, opts) {
+    const result = await launch.executeAccountLaunch(username, opts);
+    assert.equal(result.success, true, JSON.stringify(result));
 }
 
 const lastStatus = () => win.statuses().at(-1);
@@ -70,10 +66,8 @@ test('a second launch while one runs is refused, from the window and from the tr
 
     killChild.exit(0);
     assert.equal((await first).success, true);
-    const scripts = fx.loginScripts();
-    assert.equal(scripts.length, 1, 'exactly one login script');
-    assert.ok(scripts[0].args.includes('alice'));
-    assert.ok(!scripts[0].args.includes('bob'));
+    assert.equal(fx.spawned.filter(child => !child.isPowerShellCommand).length, 1);
+    assert.equal(fx.loginScripts().length, 0);
 });
 
 test('cancel while the clients are being closed stops the launch before any credentials', async () => {
@@ -95,124 +89,27 @@ test('cancel while the clients are being closed stops the launch before any cred
 
     // And the next launch is not blocked by the cancelled one.
     fx.setSpawnBehavior((child) => { if (child.isPowerShellCommand) child.exit(0); });
-    await startUntilScript('bob');
+    await startLaunch('bob');
 });
 
-test('cancel while the login script runs kills it and reports nothing afterwards', async () => {
+test('cancel while waiting for Riot clears progress without submitting any credentials', async () => {
     setup();
-    const script = await startUntilScript('alice');
+    await startLaunch('alice');
+    assert.match(lastStatus().message, /Sign in in the Riot Client/);
     assert.deepEqual(await fx.invoke('cancel-launch'), { success: true });
-    assert.equal(script.killed, true);
-    await fx.waitFor(() => script.listenerCount('close') && script.exited, 'the script to close');
-    await fx.tick();
     assert.equal(lastStatus(), null);
-    assert.ok(!win.statuses().some(s => s?.error || s?.progress === 100));
-    assert.deepEqual(launch.cancelLaunch(), { success: false, message: 'No launch in progress' });
-});
-
-test('the password reaches the script as base64 UTF-8 on stdin, never in argv', async () => {
-    const password = 'pä§wörd€ "x" & y';
-    setup({ accounts: [{ username: 'alice', password: encrypt(password) }] });
-    const script = await startUntilScript('alice');
-    assert.equal(script.stdinData.endsWith('\n'), true);
-    assert.equal(Buffer.from(script.stdinData.trim(), 'base64').toString('utf8'), password);
-    assert.ok(!script.args.some(a => String(a).includes('wörd')));
-    const nb = script.args[script.args.indexOf('-NotBefore') + 1];
-    assert.match(nb, /^\d{13}$/, 'start time passed for the window check');
-    assert.equal(script.options.windowsHide, true);
-});
-
-test('a different signed-in account is reported instead of Done', async () => {
-    setup({ lcuConnected: true, session: { username: 'someoneelse' } });
-    const script = await startUntilScript('alice');
-    script.exit(0);
-    await fx.waitFor(() => lastStatus()?.error, 'an error status');
-    assert.equal(lastStatus().kind, 'wrong-account');
-    assert.match(lastStatus().message, /someoneelse/);
-    assert.ok(!win.statuses().some(s => s?.progress === 100));
-});
-
-test('the right signed-in account ends in Done with one 100 % status', async () => {
-    setup();
-    const script = await startUntilScript('alice');
-    script.print('Game client detected - done!\r\nLogin script complete\r\n');
-    lcu.connected = true;
-    lcu.request = async (m, ep) => (ep === '/lol-login/v1/session' ? { username: 'ALICE' } : null);
-    script.exit(0);
-    await fx.waitFor(() => lastStatus()?.kind === 'done', 'done');
-    assert.equal(win.statuses().filter(s => s?.progress === 100).length, 1);
-    assert.equal(fx.notifications.length, 1);
+    assert.equal(fx.loginScripts().length, 0);
     assert.equal(launch.isLaunchInProgress(), false);
-});
-
-test('exit code 3 is not reported as logged in and offers a retry', async () => {
-    setup();
-    const script = await startUntilScript('alice');
-    script.exit(3);
-    await fx.waitFor(() => lastStatus()?.error, 'an error status');
-    assert.equal(lastStatus().kind, 'needs-action');
-    assert.doesNotMatch(lastStatus().message, /Logged in/i);
-});
-
-test('exit code 3 with a signed-out Riot Client says the sign-in did not complete', async (t) => {
-    setup();
-    const server = http.createServer((req, res) => {
-        res.statusCode = req.url === '/rso-auth/v1/authorization' ? 404 : 500;
-        res.end('{}');
-    });
-    await new Promise(r => server.listen(0, '127.0.0.1', r));
-    t.after(() => server.close());
-    const lockDir = path.join(process.env.LOCALAPPDATA, 'Riot Games', 'Riot Client', 'Config');
-    fs.mkdirSync(lockDir, { recursive: true });
-    fs.writeFileSync(path.join(lockDir, 'lockfile'), `Riot Client:1:${server.address().port}:secret:http`);
-    t.after(() => fs.rmSync(path.join(lockDir, 'lockfile'), { force: true }));
-
-    const script = await startUntilScript('alice');
-    script.exit(3);
-    await fx.waitFor(() => lastStatus()?.error, 'an error status');
-    assert.match(lastStatus().message, /Sign-in did not complete/);
-});
-
-test('with minimize on launch, a failed login brings the window back and notifies', async () => {
-    setup({ accounts: [{ username: 'alice', password: encrypt('x'), minimizeOnLaunch: true }] });
-    const script = await startUntilScript('alice');
-    assert.equal(win.counts.hide, 1);
-    assert.equal(launch.isWindowHiddenByLaunch(), true);
-    script.exit(2);
-    await fx.waitFor(() => lastStatus()?.error, 'an error status');
-    assert.equal(win.visible, true);
-    assert.ok(win.counts.show >= 1);
-    assert.equal(fx.notifications.length, 1);
-    assert.match(fx.notifications[0].body, /front/);
-});
-
-test('a login script killed from outside is a failure, not success', async () => {
-    setup();
-    const script = await startUntilScript('alice');
-    script.exit(null, 'SIGTERM');
-    await fx.waitFor(() => lastStatus()?.error, 'an error status');
-    assert.match(lastStatus().message, /interrupted/);
-    assert.equal(fx.notifications.length, 0, 'visible window: no notification');
-});
-
-test('a login script that cannot start is reported, and the next launch works', async () => {
-    setup();
-    const script = await startUntilScript('alice');
-    script.emit('error', Object.assign(new Error('spawn powershell.exe ENOENT'), { code: 'ENOENT' }));
-    script.stdin.emit('error', new Error('EPIPE'));
-    assert.equal(lastStatus().error, true);
-    assert.equal(launch.isLaunchInProgress(), false);
-    await startUntilScript('bob');
 });
 
 test('a Riot Client that fails to start ends the launch with an error', async () => {
     setup();
-    const script = await startUntilScript('alice');
+    await startLaunch('alice');
     const rc = fx.spawned.find(c => c.command !== 'powershell.exe');
     rc.emit('error', Object.assign(new Error('EACCES'), { code: 'EACCES' }));
     assert.equal(lastStatus().error, true);
     assert.match(lastStatus().message, /EACCES/);
-    assert.equal(script.killed, true, 'login script stopped');
+    assert.equal(launch.isLaunchInProgress(), false);
 });
 
 test('all client processes are closed and gone before the Riot Client starts', async () => {
@@ -225,6 +122,7 @@ test('all client processes are closed and gone before the Riot Client starts', a
     for (const name of ['LeagueClient', 'LeagueClientUxRender', 'RiotClientServices', 'Riot Client', 'RiotClientUx']) {
         assert.ok(command.includes(`'${name}'`), `kills ${name}`);
     }
+    assert.doesNotMatch(command, /valorant/i);
     assert.match(command, /for \(\$i = 0/, 'waits for the processes to exit');
     assert.equal(killChild.options.windowsHide, true);
     await fx.tick();
@@ -234,13 +132,23 @@ test('all client processes are closed and gone before the Riot Client starts', a
     assert.ok(fx.spawned.some(c => c.command !== 'powershell.exe'), 'Riot Client started after');
 });
 
+test('a failed shutdown does not start another client or type credentials', async () => {
+    setup();
+    fx.setSpawnBehavior(child => { if (child.isPowerShellCommand) child.exit(1); });
+    const result = await launch.executeAccountLaunch('alice');
+    assert.equal(result.success, false);
+    assert.match(result.message, /Could not close/);
+    assert.equal(fx.spawned.length, 1);
+    assert.equal(launch.isLaunchInProgress(), false);
+});
+
 test('launching another account during a game asks first', async () => {
     setup({ lcuConnected: true, session: { username: 'bob' }, phase: 'InProgress' });
     const res = await launch.executeAccountLaunch('alice');
     assert.equal(res.needsConfirm, true);
     assert.equal(fx.spawned.length, 0, 'nothing killed');
     assert.equal(launch.isLaunchInProgress(), false);
-    await startUntilScript('alice', { confirmed: true });
+    await startLaunch('alice', { confirmed: true });
 });
 
 test('while the vault is locked nothing launches, the tray path shows the lock screen', async () => {
@@ -256,7 +164,7 @@ test('while the vault is locked nothing launches, the tray path shows the lock s
 });
 
 test('a tray launch of a minimize-on-launch account does not show the window', async () => {
-    setup({ visible: false, accounts: [{ username: 'alice', password: encrypt('x'), minimizeOnLaunch: true }] });
+    setup({ visible: false, accounts: [{ username: 'alice', password: 'x', minimizeOnLaunch: true }] });
     await launch.launchFromOutside('alice');
     assert.equal(win.counts.show, 0);
 });
@@ -271,39 +179,10 @@ test('a tray launch that cannot start shows the error', async () => {
     assert.match(fx.notifications[0].body, /not found/);
 });
 
-test('progress follows the script line by line, ignores other lines and never goes back', async () => {
-    setup();
-    const script = await startUntilScript('alice');
-    const before = win.statuses().length;
-    script.print('Found window: \'Riot Client\' - wait');
-    script.print('ing for UI to load...\r\nRiot Client window focused\r\nCredentials submitted\r\n');
-    script.print('Transcript started, output file is x\r\nERROR: something\r\nWaiting for Riot Client window...\r\n');
-    const got = win.statuses().slice(before);
-    assert.deepEqual(got.map(s => s.progress), [65, 80]);
-    assert.ok(!got.some(s => /Logging in/.test(s.message)));
-});
-
-test('statusForLine maps script lines and ignores unknown ones', () => {
-    assert.equal(launch.statusForLine('Polling for the game client launch...').progress, 82);
-    assert.equal(launch.statusForLine('Game client detected - done!', 'Valorant').message, 'Valorant is starting...');
-    assert.equal(launch.statusForLine('Login script complete'), null, 'only the close handler reports 100');
-    assert.equal(launch.statusForLine('ERROR: Lost focus'), null);
-});
-
 test('verifyLoggedInAccount compares usernames case-insensitively', () => {
     assert.deepEqual(launch.verifyLoggedInAccount('Alice', { username: 'alice' }), { ok: true });
     assert.deepEqual(launch.verifyLoggedInAccount('alice', { username: 'bob' }), { ok: false, actual: 'bob' });
     assert.deepEqual(launch.verifyLoggedInAccount('alice', null), { ok: null });
-});
-
-test('an unexpected error in the login script is not reported as a missing window', async () => {
-    setup();
-    const script = await startUntilScript('alice');
-    script.exit(5);
-    await fx.waitFor(() => lastStatus()?.error, 'an error status');
-    assert.equal(lastStatus().kind, 'failed');
-    assert.match(lastStatus().message, /unexpected error/);
-    assert.doesNotMatch(lastStatus().message, /did not appear/);
 });
 
 // lastUsed was saved from the list loaded before the client checks (up to
@@ -314,18 +193,18 @@ test('recording lastUsed keeps changes made while the launch checked the client'
         session: () => {
             // Meanwhile: bob gets a new label, carol is deleted.
             fx.writeAccounts([
-                { username: 'alice', password: encrypt('pw-a') },
-                { username: 'bob', password: encrypt('pw-b'), label: 'edited meanwhile' },
+                { username: 'alice', password: 'pw-a' },
+                { username: 'bob', password: 'pw-b', label: 'edited meanwhile' },
             ]);
             return { username: 'someone-else' };
         },
         accounts: [
-            { username: 'alice', password: encrypt('pw-a') },
-            { username: 'bob', password: encrypt('pw-b') },
-            { username: 'carol', password: encrypt('pw-c') },
+            { username: 'alice', password: 'pw-a' },
+            { username: 'bob', password: 'pw-b' },
+            { username: 'carol', password: 'pw-c' },
         ],
     });
-    await startUntilScript('alice');
+    await startLaunch('alice');
     const saved = fx.readAccounts();
     assert.deepEqual(saved.map(a => a.username), ['alice', 'bob'], 'carol stays deleted');
     assert.equal(saved.find(a => a.username === 'bob').label, 'edited meanwhile');
@@ -339,10 +218,10 @@ test('League is started through the Riot Client once the sign-in is done, not be
     setup();
     let signedIn = false;
     const launches = [];
-    const server = http.createServer((req, res) => {
+    const port = mockLocalHttp(t, (req, res) => {
         if (req.url === '/rso-auth/v1/authorization') {
             res.statusCode = signedIn ? 200 : 404;
-        } else if (req.method === 'POST' && req.url === '/product-launcher/v1/products/league_of_legends/patchlines/live') {
+        } else if (req.method === 'POST' && /^\/product-launcher\/v1\/products\/league_of_legends\/patchlines\/live\?clickWallMs=\d+$/.test(req.url)) {
             launches.push(req.headers.authorization);
             res.statusCode = 204;
         } else {
@@ -350,22 +229,19 @@ test('League is started through the Riot Client once the sign-in is done, not be
         }
         res.end(res.statusCode === 204 ? '' : '{}');
     });
-    await new Promise(r => server.listen(0, '127.0.0.1', r));
-    t.after(() => server.close());
+
     const lockDir = path.join(process.env.LOCALAPPDATA, 'Riot Games', 'Riot Client', 'Config');
     fs.mkdirSync(lockDir, { recursive: true });
-    fs.writeFileSync(path.join(lockDir, 'lockfile'), `Riot Client:1:${server.address().port}:secret:http`);
+    fs.writeFileSync(path.join(lockDir, 'lockfile'), `Riot Client:1:${port}:secret:http`);
     t.after(() => fs.rmSync(path.join(lockDir, 'lockfile'), { force: true }));
 
-    const script = await startUntilScript('alice');
-    script.print('Credentials submitted\r\n');
+    await startLaunch('alice');
     await new Promise(r => setTimeout(r, 1500));
     assert.equal(launches.length, 0, 'nothing while a code or captcha may still be open');
     signedIn = true;
     await fx.waitFor(() => launches.length === 1, 'League started through the Riot Client', 4000);
     assert.equal(launches[0], `Basic ${Buffer.from('riot:secret').toString('base64')}`);
-    await fx.waitFor(() => /Launching League/.test(lastStatus()?.message || ''), 'the Launching League status');
-    script.exit(0);
+    await fx.waitFor(() => /Waiting for League to open/.test(lastStatus()?.message || ''), 'the accepted Play status');
 });
 
 test('an account that is already signed in still counts as used', async () => {
@@ -373,4 +249,93 @@ test('an account that is already signed in still counts as used', async () => {
     const res = await launch.executeAccountLaunch('alice');
     assert.equal(res.success, true);
     assert.ok(fx.readAccounts().find((a) => a.username === 'alice').lastUsed > 0);
+});
+
+test('a cold launch asks Riot to start League directly and reuses the resulting session', async t => {
+    const client = path.join(sandbox, 'Riot Client', 'RiotClientServices.exe');
+    fs.mkdirSync(path.dirname(client), { recursive: true });
+    fs.writeFileSync(client, '');
+    t.after(() => fs.rmSync(client, { force: true }));
+
+    setup({ session: { username: 'alice' } });
+    fx.setSpawnBehavior(child => {
+        if (child.isPowerShellCommand || child.args.includes('-Minimize')) child.exit(0);
+        if (child.command === client) lcu.connected = true;
+    });
+    const calls = [];
+    const port = mockLocalHttp(t, (req, res) => {
+        calls.push(req.method);
+        res.end('{}');
+    });
+    const lockDir = path.join(process.env.LOCALAPPDATA, 'Riot Games', 'Riot Client', 'Config');
+    fs.mkdirSync(lockDir, { recursive: true });
+    const lockfile = path.join(lockDir, 'lockfile');
+    fs.writeFileSync(lockfile, `Riot Client:1:${port}:secret:http`);
+    t.after(() => fs.rmSync(lockfile, { force: true }));
+
+    await startLaunch('alice');
+    await fx.waitFor(() => lastStatus()?.kind === 'done', 'direct launch');
+    assert.deepEqual(fx.spawned.find(child => child.command === client)?.args, [
+        '--launch-product=league_of_legends', '--launch-patchline=live', '--allow-direct-launch',
+    ]);
+    assert.equal(calls.includes('POST'), false);
+    assert.equal(fx.spawned.some(child => child.args.includes('-PlayLeague')), false);
+});
+
+test('HTTP 464 falls back to Play in the existing Riot session', async t => {
+    const client = path.join(sandbox, 'Riot Client', 'RiotClientServices.exe');
+    fs.mkdirSync(path.dirname(client), { recursive: true });
+    fs.writeFileSync(client, '');
+    t.after(() => fs.rmSync(client, { force: true }));
+
+    const cases = [
+        { description: 'opens League when Play is available', clicked: true, kind: 'done', message: /Signed in/ },
+        { description: 'accepts a League session that appears after Play disappears', clicked: false, kind: 'done', message: /Signed in/ },
+        { description: 'reports when Play and the League session are unavailable', clicked: false, kind: 'needs-action', message: /enabled League Play button/ },
+    ];
+    for (const { description, clicked, kind, message } of cases) {
+        await t.test(description, { timeout: 4500 }, async subtest => {
+            setup({ session: { username: 'alice' } });
+            fx.setSpawnBehavior(child => {
+                if (child.args.includes('-PlayLeague')) {
+                    lcu.connected = clicked;
+                    child.exit(clicked ? 0 : 1);
+                }
+                if (child.args.includes('-Minimize')) child.exit(0);
+            });
+            const calls = [];
+            const port = mockLocalHttp(subtest, (req, res) => {
+                calls.push(req.url);
+                if (req.url === '/riot-client-auth/v1/userinfo') {
+                    res.end(JSON.stringify({ preferred_username: 'ALICE' }));
+                    return;
+                }
+                res.statusCode = 464;
+                res.end('{}');
+            });
+            const lockDir = path.join(process.env.LOCALAPPDATA, 'Riot Games', 'Riot Client', 'Config');
+            fs.mkdirSync(lockDir, { recursive: true });
+            const lockfile = path.join(lockDir, 'lockfile');
+            fs.writeFileSync(lockfile, `Riot Client:1:${port}:secret:http`);
+            subtest.after(() => fs.rmSync(lockfile, { force: true }));
+
+            await startLaunch('alice');
+            if (!clicked) {
+                await fx.waitFor(() => /Waiting for League to open/.test(lastStatus()?.message), 'the session check after Play');
+                if (kind === 'done') {
+                    lcu.connected = true;
+                } else {
+                    subtest.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+                    subtest.mock.timers.tick(26000);
+                }
+            }
+            await fx.waitFor(() => lastStatus()?.kind === kind, description);
+            assert.match(lastStatus().message, message);
+            assert.equal(win.statuses().filter(status => status?.error).length, kind === 'done' ? 0 : 1);
+            assert.equal(fx.spawned.filter(child => child.args.includes('-PlayLeague')).length, 1);
+            assert.equal(fx.loginScripts().length, 0);
+            assert.ok(fx.spawned.every(child => child.command === 'powershell.exe' && !child.isPowerShellCommand));
+            assert.equal(calls.filter(url => url.includes('clickWallMs=')).length, 1);
+        });
+    }
 });

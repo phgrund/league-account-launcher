@@ -1,14 +1,13 @@
-// Tray, jump list, second instance (`--launch=`), quitting and the overlay
-// hotkey: the ways into the app that do not go through the renderer.
+// Tray, jump list, second instance (`--launch=`), and quitting: the ways into the app that do not go through the renderer.
 const fx = require('./helpers/a-fakes');
-const Module = require('module');
 const { EventEmitter } = require('events');
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 
 const { fakeElectron } = fx;
 
-// ── Extra electron stubs, installed before the modules under test load ──────
 const appHandlers = {};
 const userTasks = [];
 Object.assign(fakeElectron.app, {
@@ -37,30 +36,17 @@ fakeElectron.BrowserWindow = class extends EventEmitter {
     isDestroyed() { return false; }
     isVisible() { return this.shown > 0; }
 };
-const registered = [];
-fakeElectron.globalShortcut = {
-    register: (key) => { registered.push(key); return true; },
-    unregister: () => {},
-    unregisterAll: () => {},
-};
-const originalLoad = Module._load;
-Module._load = function (request, parent, isMain) {
-    if (request === 'electron-updater') return { autoUpdater: new EventEmitter() };
-    return originalLoad.call(this, request, parent, isMain);
-};
-
 const state = require('../src/main/state');
-const { encrypt } = require('../src/main/services/encryption');
 const windows = require('../src/main/windows');
 const launch = require('../src/main/ipc/launch');
-const { registerOverlayHotkey } = require('../src/main/overlay-hotkey');
 const { launchArgUsername } = require('../src/main/main');
+const { createAccountShortcut } = require('../src/main/services/account-shortcut');
 
 function setup({ locked = false, accounts } = {}) {
     launch.cancelLaunch();
     fx.spawned.length = 0;
     fx.fakeVault.locked = locked;
-    fx.writeAccounts(accounts || [{ username: 'alice', label: 'Main', password: encrypt('x') }]);
+    fx.writeAccounts(accounts || [{ username: 'alice', label: 'Main', password: 'x' }]);
     state.mainWindow = fx.fakeWindow({ visible: false });
 }
 
@@ -97,11 +83,19 @@ test('the jump list names no accounts while the vault is locked', () => {
     assert.equal(userTasks.at(-1)[0].title, 'Launch Main');
 });
 
-test('a jump-list launch while the vault is locked only opens the lock screen', async () => {
+test('a shortcut opens the lock screen and resumes Play after vault unlock', async () => {
     setup({ locked: true });
-    await appHandlers['second-instance']({}, ['app.exe', '--launch=alice']);
+    const selection = '--launch-account=' + Buffer.from('alice').toString('base64url');
+    await appHandlers['second-instance']({}, ['app.exe', selection]);
     assert.equal(state.mainWindow.visible, true);
     assert.equal(fx.spawned.length, 0);
+    state.config.lolPath = path.join(fx.userData, 'LeagueClient.exe');
+    fs.writeFileSync(state.config.lolPath, '');
+    fx.fakeVault.locked = false;
+    assert.equal((await launch.resumeExternalLaunch()).success, true);
+    assert.equal(launch.isLaunchInProgress(), true);
+    assert.equal(launch.resumeExternalLaunch(), undefined);
+    launch.cancelLaunch();
 });
 
 test('the app runs in English, whatever language Windows uses', () => {
@@ -119,6 +113,35 @@ test('--launch= keeps usernames that contain =', () => {
     assert.equal(launchArgUsername(['app.exe']), null);
 });
 
+test('a shortcut targets the manager and selects the saved account with one argument', async t => {
+    setup();
+    const username = 'Example = "account"';
+    const target = path.join(fx.userData, 'LoL - Main.lnk');
+    const previousProgramData = process.env.ProgramData;
+    process.env.ProgramData = path.join(fx.userData, 'ProgramData');
+    t.after(() => {
+        if (previousProgramData === undefined) delete process.env.ProgramData;
+        else process.env.ProgramData = previousProgramData;
+    });
+    const icon = path.join(process.env.ProgramData, 'Riot Games', 'Metadata',
+        'league_of_legends.live', 'league_of_legends.live.ico');
+    fs.mkdirSync(path.dirname(icon), { recursive: true });
+    fs.writeFileSync(icon, '');
+    t.mock.method(fakeElectron.dialog, 'showSaveDialog', async () => ({ canceled: false, filePath: target }));
+    let shortcut;
+    fakeElectron.shell.writeShortcutLink = (...args) => { shortcut = args; return true; };
+    t.after(() => { delete fakeElectron.shell.writeShortcutLink; });
+
+    assert.deepEqual(await createAccountShortcut(state.mainWindow, { username, label: 'Main' }), { success: true });
+    assert.equal(shortcut[0], target);
+    assert.equal(shortcut[2].target, process.execPath);
+    assert.equal(shortcut[2].cwd, fakeElectron.app.getAppPath());
+    assert.equal(shortcut[2].icon, icon);
+    assert.equal(shortcut[2].iconIndex, 0);
+    const selection = shortcut[2].args.match(/--launch-account=[\w-]+$/)[0];
+    assert.equal(launchArgUsername([process.execPath, selection]), username);
+});
+
 test('every quit gets past the hide-to-tray close handler', () => {
     fakeElectron.app.isQuiting = false;
     appHandlers['before-quit']();
@@ -127,12 +150,14 @@ test('every quit gets past the hide-to-tray close handler', () => {
 });
 
 test('the first ready-to-show does not undo minimize on launch', async () => {
-    setup({ accounts: [{ username: 'alice', password: encrypt('x'), minimizeOnLaunch: true }] });
+    setup({ accounts: [{ username: 'alice', password: 'x', minimizeOnLaunch: true }] });
     let kill;
     fx.setSpawnBehavior((child) => { if (child.isPowerShellCommand) kill = child; });
     state.config.startMinimized = false;
     windows.createMainWindow();
     const win = state.mainWindow; // the fake BrowserWindow
+    state.config.lolPath = path.join(fx.userData, 'LeagueClient.exe');
+    fs.writeFileSync(state.config.lolPath, '');
     const pending = launch.executeAccountLaunch('alice');
     await fx.waitFor(() => kill, 'the launch to hide the window');
     assert.equal(launch.isWindowHiddenByLaunch(), true);
@@ -145,13 +170,4 @@ test('the first ready-to-show does not undo minimize on launch', async () => {
     windows.createMainWindow();
     state.mainWindow.emit('ready-to-show');
     assert.equal(state.mainWindow.shown, 1, 'normal start still shows the window');
-});
-
-// The global shortcut never reached the overlay while League had the keyboard;
-// the keys are read by the game input watcher instead and stay with the game.
-test('the overlay hotkey is never registered as a global shortcut', () => {
-    state.overlayWindow = { isDestroyed: () => false };
-    registerOverlayHotkey('Ctrl+Shift+H');
-    assert.deepEqual(registered, []);
-    state.overlayWindow = null;
 });

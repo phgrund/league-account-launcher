@@ -1,412 +1,270 @@
 param (
-    [string]$Username,
-    [string]$RiotClientPath = "",
-    # Unix time in ms at which the app started the Riot Client; only windows
-    # of processes started after it can receive the credentials.
+    [Parameter(Mandatory = $true)][string]$InstallDir,
     [long]$NotBefore = 0,
-    # What the Riot Client starts after the sign-in, and the process that shows
-    # it came up: League (default) or Valorant.
-    [ValidateSet("league_of_legends", "valorant")]
-    [string]$Product = "league_of_legends",
-    [ValidateSet("LeagueClient", "VALORANT-Win64-Shipping")]
-    [string]$GameProcess = "LeagueClient",
-    # Tick "Stay signed in" before typing, so the app can keep the sign-in
-    # and skip typing the password next time.
-    [switch]$StaySignedIn
+    [switch]$Minimize,
+    [switch]$PlayLeague,
+    [long]$StartedBefore = 0
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = 'Stop'
 
-# One log per run (not appended forever), without the username. It used to be
-# a PowerShell transcript, whose header holds the full command line and so the
-# login name. A locked log file must not stop the login: writing is best-effort.
-$logPath = Join-Path $env:TEMP "leaguelogin_debug.txt"
-try { Set-Content -Path $logPath -Value $null -Force } catch { }
+# Text goes only to the focused HWND belonging to the verified Riot window.
+# SendKeys is reserved for Ctrl+A and Enter, which contain no credentials.
+$windowApi = @'
+using System;
+using System.Runtime.InteropServices;
 
-# Every line goes to the app (stdout) and to the log file.
-function Log ([string]$message) {
-    Write-Host $message
-    try { Add-Content -Path $logPath -Value $message } catch { }
+public static class RiotLoginWindow {
+    [StructLayout(LayoutKind.Sequential)]
+    private struct GuiThreadInfo {
+        public uint Size, Flags;
+        public IntPtr Active, Focus, Capture, MenuOwner, MoveSize, Caret;
+        public int Left, Top, Right, Bottom;
+    }
+
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr window, out uint process);
+    [DllImport("user32.dll")] private static extern bool GetGUIThreadInfo(uint thread, ref GuiThreadInfo info);
+    [DllImport("user32.dll")] private static extern IntPtr GetAncestor(IntPtr window, uint flags);
+    [DllImport("user32.dll")] private static extern bool IsIconic(IntPtr window);
+    [DllImport("user32.dll")] private static extern bool ShowWindowAsync(IntPtr window, int command);
+    [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr window);
+    [DllImport("user32.dll")] private static extern bool AttachThreadInput(uint from, uint to, bool attach);
+    [DllImport("kernel32.dll")] private static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern bool PostMessage(
+        IntPtr window, uint message, UIntPtr key, IntPtr repeat);
+
+    public static void Activate(IntPtr window) {
+        if (IsIconic(window)) ShowWindowAsync(window, 9);
+        if (GetForegroundWindow() == window || SetForegroundWindow(window)) return;
+        uint process;
+        uint foreground = GetWindowThreadProcessId(GetForegroundWindow(), out process);
+        uint current = GetCurrentThreadId();
+        if (foreground == 0 || foreground == current || !AttachThreadInput(current, foreground, true)) return;
+        try { SetForegroundWindow(window); }
+        finally { AttachThreadInput(current, foreground, false); }
+    }
+
+    public static void Minimize(IntPtr window) {
+        ShowWindowAsync(window, 6);
+    }
+
+    public static bool WriteText(IntPtr window, string text) {
+        if (GetForegroundWindow() != window || string.IsNullOrEmpty(text)) return false;
+        foreach (char character in text) {
+            if (char.IsControl(character)) return false;
+        }
+        uint owner, focusOwner;
+        uint thread = GetWindowThreadProcessId(window, out owner);
+        var info = new GuiThreadInfo { Size = (uint)Marshal.SizeOf(typeof(GuiThreadInfo)) };
+        if (thread == 0 || !GetGUIThreadInfo(thread, ref info) || info.Focus == IntPtr.Zero ||
+            GetAncestor(info.Focus, 2) != window ||
+            GetWindowThreadProcessId(info.Focus, out focusOwner) == 0 || focusOwner != owner) return false;
+
+        foreach (char character in text) {
+            if (!PostMessage(info.Focus, 0x0102, new UIntPtr((uint)character), new IntPtr(1))) return false;
+        }
+        return true;
+    }
 }
-
-function Exit-Script ([int]$code) {
-    exit $code
-}
-
-# Any error nothing else catches ends the script with its own code (5), so the
-# app can tell it apart from "window not found" (1).
-trap {
-    Log "ERROR: $_"
-    Exit-Script 5
-}
-
-Log "Script Started at $(Get-Date)"
-
-# Read the password from stdin rather than a command-line argument, so it
-# never appears in this process's argv (visible to other local processes via
-# Task Manager / WMI for the life of the process). The app sends base64 of the
-# UTF-8 bytes: Windows PowerShell decodes console input with the OEM code
-# page, which garbled every non-ASCII character (umlauts, sharp s, euro sign).
-$encodedPassword = [Console]::In.ReadLine()
-if ([string]::IsNullOrWhiteSpace($encodedPassword)) {
-    Log "ERROR: No password received"
-    Exit-Script 4
-}
-$Password = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($encodedPassword.Trim()))
-
-Add-Type -AssemblyName System.Windows.Forms
-
-# BlockInput helper
-try {
-    $memberDef = '[DllImport("user32.dll")] public static extern bool BlockInput(bool fBlockIt);'
-    $inputBlocker = Add-Type -MemberDefinition $memberDef -Name 'InputBlocker' -Namespace Win32 -PassThru
-}
-catch { }
-
-# Window-activation helpers. WScript.Shell's AppActivate (the old approach) is
-# unreliable against a window that just finished loading — Windows' foreground-
-# lock protection can silently reject it, and the old code never checked the
-# return value before typing, so credentials sometimes went to whatever window
-# actually had focus instead of the Riot Client.
-try {
-    $winApiDef = @'
-[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
-[DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
-[DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
-[DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
-[DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
 '@
-    $winApi = Add-Type -MemberDefinition $winApiDef -Name 'WinApi' -Namespace Win32 -PassThru
-}
-catch { $winApi = $null }
 
-function Escape-SendKeys ($text) {
-    $sb = New-Object System.Text.StringBuilder
-    foreach ($char in $text.ToCharArray()) {
-        if ("+^%~(){}[]".IndexOf($char) -ge 0) {
-            [void]$sb.Append("{$char}")
-        }
-        else {
-            [void]$sb.Append($char)
-        }
-    }
-    return $sb.ToString()
-}
+function Find-RiotLogin {
+    $scope = [System.Windows.Automation.TreeScope]::Descendants
+    $editType = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Edit)
+    $checkboxType = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::CheckBox)
 
-function Force-Foreground {
-    param ($hwnd)
-    if (-not $winApi -or $hwnd -eq [IntPtr]::Zero) { return $false }
-    try {
-        $curFg = [Win32.WinApi]::GetForegroundWindow()
-        if ($curFg -eq $hwnd) { return $true }
+    foreach ($client in (Get-Process -Name 'Riot Client', 'RiotClientUx' -ErrorAction SilentlyContinue)) {
+        try {
+            if (-not $client.Path -or -not $client.Path.StartsWith($installPrefix, [StringComparison]::OrdinalIgnoreCase)) { continue }
+            if ($client.StartTime.ToUniversalTime() -lt $earliest -or $client.MainWindowHandle -eq 0) { continue }
 
-        [uint32]$dummy = 0
-        $fgThread  = [Win32.WinApi]::GetWindowThreadProcessId($curFg, [ref]$dummy)
-        $curThread = [Win32.WinApi]::GetCurrentThreadId()
+            $handle = $client.MainWindowHandle
+            $root = [System.Windows.Automation.AutomationElement]::FromHandle($handle)
+            $fields = @($root.FindAll($scope, $editType) | Where-Object {
+                -not $_.Current.IsOffscreen -and $_.Current.IsEnabled
+            })
+            $users = @($fields | Where-Object { -not $_.Current.IsPassword })
+            $passwords = @($fields | Where-Object { $_.Current.IsPassword })
+            if ($users.Count -ne 1 -or $passwords.Count -ne 1) { continue }
 
-        # A background process normally can't steal foreground focus; briefly
-        # attaching input state to the current foreground thread lets it.
-        [void][Win32.WinApi]::AttachThreadInput($curThread, $fgThread, $true)
-        [void][Win32.WinApi]::ShowWindowAsync($hwnd, 9)  # SW_RESTORE
-        [void][Win32.WinApi]::SetForegroundWindow($hwnd)
-        [void][Win32.WinApi]::AttachThreadInput($curThread, $fgThread, $false)
-
-        return ([Win32.WinApi]::GetForegroundWindow() -eq $hwnd)
-    }
-    catch { return $false }
-}
-
-function Ensure-Focus {
-    param ($procId, $hwnd)
-    if (Force-Foreground -hwnd $hwnd) { return $true }
-    # Fallback to the older COM-based activation, best-effort.
-    try {
-        $wshell = New-Object -ComObject WScript.Shell
-        return [bool]$wshell.AppActivate($procId)
-    }
-    catch { return $false }
-}
-
-# Process id that owns the foreground window, or 0.
-function Get-ForegroundProcessId {
-    if (-not $winApi) { return 0 }
-    try {
-        [uint32]$fgPid = 0
-        [void][Win32.WinApi]::GetWindowThreadProcessId([Win32.WinApi]::GetForegroundWindow(), [ref]$fgPid)
-        return [int]$fgPid
-    }
-    catch { return 0 }
-}
-
-# Checked right before each keystroke batch: credentials only ever go to the
-# Riot Client, never to whatever took focus since. Any window of a Riot Client
-# UI process started for this login counts: the client replaces its loading
-# window with the login window, so one fixed window handle went stale and the
-# login stopped with "Lost focus" although the Riot Client had the focus.
-function Test-StillFocused {
-    param ($hwnd)
-    if (-not $winApi) { return $true }  # no API to check with; Wait-ForFocus already ran
-    try {
-        if ([Win32.WinApi]::GetForegroundWindow() -eq $hwnd) { return $true }
-        $fgPid = Get-ForegroundProcessId
-        if ($fgPid -eq 0) { return $false }
-        return [bool](Get-RiotUiProcesses | Where-Object { $_.Id -eq $fgPid })
-    }
-    catch { return $false }
-}
-
-# Name of the process that has the focus, for the log (never a window title).
-function Get-ForegroundProcessName {
-    $fgPid = Get-ForegroundProcessId
-    if ($fgPid -eq 0) { return "unknown" }
-    try { return (Get-Process -Id $fgPid -ErrorAction Stop).ProcessName }
-    catch { return "unknown" }
-}
-
-# Ticks the Riot Client's "Stay signed in" checkbox through UI Automation
-# instead of keystrokes: its place in the tab order is not stable between
-# Riot Client versions, and counting TABs blind could type into the wrong
-# control. Chromium builds its accessibility tree on the first UIA query, so
-# the lookup is retried for a few seconds. Returns a short status; nothing
-# here is fatal, the login goes on without the tick.
-function Set-StaySignedIn {
-    param ($hwnd)
-    try {
-        Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
-        $AE   = [System.Windows.Automation.AutomationElement]
-        $root = $AE::FromHandle($hwnd)
-        $isCheckBox = New-Object System.Windows.Automation.PropertyCondition(
-            $AE::ControlTypeProperty, [System.Windows.Automation.ControlType]::CheckBox)
-        $isEdit = New-Object System.Windows.Automation.PropertyCondition(
-            $AE::ControlTypeProperty, [System.Windows.Automation.ControlType]::Edit)
-
-        $boxes = $null
-        for ($i = 0; $i -lt 8; $i++) {
-            $boxes = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $isCheckBox)
-            if ($boxes.Count -gt 0) { break }
-            Start-Sleep -Milliseconds 500
-        }
-        if (-not $boxes -or $boxes.Count -eq 0) { return "checkbox not found" }
-
-        # The login form has one checkbox: match its label first (English,
-        # German), else take the only one for other client languages.
-        $box = $null
-        foreach ($b in $boxes) {
-            if ($b.Current.Name -match 'stay signed in|signed in|angemeldet') { $box = $b; break }
-        }
-        if (-not $box -and $boxes.Count -eq 1) { $box = $boxes[0] }
-        if (-not $box) { return "checkbox ambiguous ($($boxes.Count) found)" }
-
-        $pattern = $null
-        if ($box.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$pattern)) {
-            if ($pattern.Current.ToggleState -eq [System.Windows.Automation.ToggleState]::On) {
-                return "already ticked"
+            $remember = @($root.FindAll($scope, $checkboxType) | Where-Object {
+                $_.Current.AutomationId -eq 'remember-me' -or
+                $_.Current.Name -match '^(stay signed in|keep me signed in|continuar conectado|manter conex.o|manter sess.o iniciada)$'
+            })
+            return @{
+                Window = $handle
+                User = $users[0]
+                Password = $passwords[0]
+                Remember = $remember
             }
-            $pattern.Toggle()
+        } catch {
+            # The Riot Client can replace its window while it loads.
         }
-        elseif ($box.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pattern)) {
-            $pattern.Invoke()
-        }
-        else { return "checkbox not clickable" }
-
-        # The typing below starts blind in the username field: put focus back.
-        $edit = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $isEdit)
-        if ($edit) {
-            try { $edit.SetFocus() } catch { }
-            Start-Sleep -Milliseconds 200
-        }
-        return "ticked"
     }
-    catch { return "failed: $($_.Exception.Message)" }
 }
 
-function Wait-ForFocus {
-    param ($procId, $hwnd, [int]$maxAttempts = 6, [int]$delayMs = 400)
-    for ($i = 0; $i -lt $maxAttempts; $i++) {
-        if (Ensure-Focus -procId $procId -hwnd $hwnd) { return $true }
-        Start-Sleep -Milliseconds $delayMs
+function Test-RiotFocus($window, $field) {
+    try {
+        return [RiotLoginWindow]::GetForegroundWindow() -eq $window -and $field.Current.HasKeyboardFocus
+    } catch {
+        return $false
+    }
+}
+
+function Invoke-LeaguePlayButton {
+    $scope = [System.Windows.Automation.TreeScope]::Descendants
+    $element = [System.Windows.Automation.AutomationElement]
+    $buttonType = New-Object System.Windows.Automation.PropertyCondition(
+        $element::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button)
+    $textType = New-Object System.Windows.Automation.PropertyCondition(
+        $element::ControlTypeProperty, [System.Windows.Automation.ControlType]::Text)
+    $leagueName = New-Object System.Windows.Automation.PropertyCondition($element::NameProperty, 'League of Legends')
+    $deadline = [DateTime]::UtcNow.AddSeconds(8)
+    $openedLeague = $false
+
+    do {
+        foreach ($client in (Get-Process -Name 'Riot Client', 'RiotClientUx' -ErrorAction SilentlyContinue)) {
+            try {
+                if (-not $client.Path -or -not $client.Path.StartsWith($installPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+                    $client.MainWindowHandle -eq 0) { continue }
+                $handle = $client.MainWindowHandle
+                [RiotLoginWindow]::Activate($handle)
+                $root = $element::FromHandle($handle)
+                $buttons = @($root.FindAll($scope, $buttonType) | Where-Object {
+                    -not $_.Current.IsOffscreen -and $_.Current.IsEnabled
+                })
+                $play = @($buttons | Where-Object { $_.Current.Name -match '^(play|jogar|jouer|spielen|jugar)(?:\s+league of legends)?$' })
+                $league = @($root.FindAll($scope, $leagueName) | Where-Object { -not $_.Current.IsOffscreen })
+                $navigate = @($league | Where-Object {
+                    $_.Current.IsEnabled -and $_.Current.ControlType -in @(
+                        [System.Windows.Automation.ControlType]::Button,
+                        [System.Windows.Automation.ControlType]::Hyperlink,
+                        [System.Windows.Automation.ControlType]::TabItem
+                    )
+                })
+
+                if (-not $openedLeague -and $navigate.Count -eq 1) {
+                    $navigationPattern = $null
+                    if ($navigate[0].TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$navigationPattern)) {
+                        $navigationPattern.Invoke()
+                        $openedLeague = $true
+                        continue
+                    }
+                    if ($navigate[0].TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$navigationPattern)) {
+                        $navigationPattern.Select()
+                        $openedLeague = $true
+                        continue
+                    }
+                }
+
+                # Accept a product-specific Play label, a verified navigation,
+                # or a visible League heading/logo in the content.
+                $leagueContent = @($league | Where-Object {
+                    $_.Current.ControlType -in @(
+                        [System.Windows.Automation.ControlType]::Text,
+                        [System.Windows.Automation.ControlType]::Image
+                    )
+                })
+                if (-not $openedLeague -and -not $leagueContent.Count -and $play.Count -eq 1) {
+                    $leagueContent = @($root.FindAll($scope, $textType) | Where-Object {
+                        -not $_.Current.IsOffscreen -and $_.Current.Name -match '^league of legends\s+\S.*\p{L}'
+                    })
+                }
+                if ($play.Count -ne 1 -or
+                    (-not $openedLeague -and -not $leagueContent.Count -and $play[0].Current.Name -notmatch 'league of legends$')) { continue }
+                $play[0].GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+                return $true
+            } catch {
+                # Riot can replace or update its game page while loading.
+            }
+        }
+        Start-Sleep -Milliseconds 350
+    } while ([DateTime]::UtcNow -lt $deadline)
+    return $false
+}
+
+function Set-RiotFieldFocus($window, $field) {
+    for ($attempt = 0; $attempt -lt 5; $attempt++) {
+        [RiotLoginWindow]::Activate($window)
+        try { $field.SetFocus() } catch { }
+        Start-Sleep -Milliseconds 150
+        if (Test-RiotFocus $window $field) { return $true }
     }
     return $false
 }
 
-# The Riot Client UI process: "Riot Client" in current builds, RiotClientUx in
-# older ones. Matching on the window title alone also matched Explorer windows,
-# browser tabs or chats with "Riot Client" in their title, and the window of
-# the client that was just closed.
-$riotUiProcessNames = @('Riot Client', 'RiotClientUx')
-# Two seconds of slack for clock granularity between Node and Windows.
-$notBeforeUtc = if ($NotBefore -gt 0) {
-    [DateTimeOffset]::FromUnixTimeMilliseconds($NotBefore).UtcDateTime.AddSeconds(-2)
-} else { [DateTime]::MinValue }
-
-function Test-StartedAfterLaunch ($p) {
-    try { return ($p.StartTime.ToUniversalTime() -ge $notBeforeUtc) }
-    catch { return $false }  # start time unreadable: not provably ours
-}
-
-function Get-RiotUiProcesses {
-    Get-Process -Name $riotUiProcessNames -ErrorAction SilentlyContinue | Where-Object { Test-StartedAfterLaunch $_ }
-}
-
-# A fresh Process object each call: MainWindowHandle is read once per object,
-# so an old one keeps pointing at the loading window.
-function Find-RiotClientWindow {
-    Get-RiotUiProcesses | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
-}
-
-# Wait for Riot Client login window
-Log "Waiting for Riot Client window..."
-$proc = $null
-for ($i = 0; $i -lt 120; $i++) {
-    $proc = Find-RiotClientWindow
-    if ($proc) { break }
-    Start-Sleep -Milliseconds 500
-}
-
-if (-not $proc) {
-    Log "Timeout: Riot Client window not found"
-    Exit-Script 1
-}
-
-Log "Found window: '$($proc.MainWindowTitle)' - waiting for UI to load..."
-Start-Sleep -Seconds 5
-
-# The window found above is often the loading window, which the client
-# replaces with the login window: look it up again now.
-$fresh = Find-RiotClientWindow
-if ($fresh) { $proc = $fresh }
-$hwnd = $proc.MainWindowHandle
-if (-not (Wait-ForFocus -procId $proc.Id -hwnd $hwnd)) {
-    Log "ERROR: Could not bring the Riot Client window to the foreground after retries - aborting rather than typing into the wrong window"
-    Exit-Script 2
-}
-Log "Riot Client window focused"
-
-if ($StaySignedIn) {
-    Log "Stay signed in: $(Set-StaySignedIn -hwnd $hwnd)"
-    # Ticking the box can move the focus: get it back before typing anything.
-    if (-not (Wait-ForFocus -procId $proc.Id -hwnd $hwnd -maxAttempts 3 -delayMs 300)) {
-        Log "ERROR: Lost focus on the Riot Client window after ticking Stay signed in - aborting"
-        Exit-Script 2
-    }
-}
-
-# Enter credentials
-$canBlock = ("Win32.InputBlocker" -as [type])
 try {
-    if ($canBlock) {
-        try { [void][Win32.InputBlocker]::BlockInput($true) }
-        catch { Log "BlockInput failed (admin required)" }
-    }
-
-    $escapedUser = Escape-SendKeys -text $Username
-    [System.Windows.Forms.SendKeys]::SendWait($escapedUser)
-    Start-Sleep -Milliseconds 300
-
-    # Something took the focus while typing (often the Riot Client bringing up
-    # its login window late): focus the client again and type the name anew,
-    # replacing whatever reached the field.
-    if (-not (Test-StillFocused -hwnd $hwnd)) {
-        Log "Focus moved to '$(Get-ForegroundProcessName)' after the username - focusing the Riot Client again"
-        $fresh = Find-RiotClientWindow
-        if ($fresh) { $proc = $fresh; $hwnd = $proc.MainWindowHandle }
-        if (-not (Wait-ForFocus -procId $proc.Id -hwnd $hwnd -maxAttempts 4 -delayMs 400)) {
-            Log "ERROR: Lost focus on the Riot Client window after the username - aborting"
-            Exit-Script 2
+    Add-Type -TypeDefinition $windowApi
+    $installPrefix = [IO.Path]::GetFullPath($InstallDir).TrimEnd('\') + '\'
+    if ($Minimize) {
+        $cutoff = [DateTimeOffset]::FromUnixTimeMilliseconds($StartedBefore).UtcDateTime
+        foreach ($client in (Get-Process -Name 'Riot Client', 'RiotClientUx' -ErrorAction SilentlyContinue)) {
+            if ($client.MainWindowHandle -ne 0 -and $client.Path -and
+                $client.StartTime.ToUniversalTime() -le $cutoff -and
+                $client.Path.StartsWith($installPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+                [RiotLoginWindow]::Minimize($client.MainWindowHandle)
+            }
         }
-        Start-Sleep -Milliseconds 300
-        [System.Windows.Forms.SendKeys]::SendWait("^a")
-        [System.Windows.Forms.SendKeys]::SendWait($escapedUser)
-        Start-Sleep -Milliseconds 300
-        if (-not (Test-StillFocused -hwnd $hwnd)) {
-            Log "ERROR: Lost focus on the Riot Client window after the username - aborting"
-            Exit-Script 2
+        exit 0
+    }
+
+    Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Windows.Forms
+    if ($PlayLeague) {
+        if (Invoke-LeaguePlayButton) { exit 0 }
+        exit 1
+    }
+
+    $earliest = [DateTimeOffset]::FromUnixTimeMilliseconds($NotBefore).UtcDateTime.AddSeconds(-2)
+    $deadline = [DateTime]::UtcNow.AddSeconds(25)
+    do {
+        $form = Find-RiotLogin
+        if ($form) { break }
+        Start-Sleep -Milliseconds 500
+    } while ([DateTime]::UtcNow -lt $deadline)
+    if (-not $form) { exit 1 }
+
+    $encoded = [Console]::In.ReadLine()
+    if (-not $encoded) { exit 4 }
+    $bytes = [Convert]::FromBase64String($encoded)
+    $encoded = $null
+    try {
+        $credential = [Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
+        if ($form.Remember.Count -eq 1) {
+            try {
+                $toggle = $null
+                if ($form.Remember[0].TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$toggle) -and
+                    $toggle.Current.ToggleState -eq [System.Windows.Automation.ToggleState]::Off) {
+                    $toggle.Toggle()
+                }
+            } catch { }
         }
+
+        if (-not (Set-RiotFieldFocus $form.Window $form.User)) { exit 2 }
+        [System.Windows.Forms.SendKeys]::SendWait('^a')
+        if (-not (Test-RiotFocus $form.Window $form.User)) { exit 2 }
+        if (-not [RiotLoginWindow]::WriteText($form.Window, $credential.username)) { exit 3 }
+        Start-Sleep -Milliseconds 200
+
+        if (-not (Set-RiotFieldFocus $form.Window $form.Password)) { exit 2 }
+        [System.Windows.Forms.SendKeys]::SendWait('^a')
+        if (-not (Test-RiotFocus $form.Window $form.Password)) { exit 2 }
+        if (-not [RiotLoginWindow]::WriteText($form.Window, $credential.password)) { exit 3 }
+        Start-Sleep -Milliseconds 300
+
+        # Riot's login form accepts Enter even when the submit button has no
+        # accessible name. Verify focus on its password field before pressing it.
+        if (-not (Test-RiotFocus $form.Window $form.Password)) { exit 2 }
+        [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+    } finally {
+        [Array]::Clear($bytes, 0, $bytes.Length)
+        $credential = $null
     }
-    [System.Windows.Forms.SendKeys]::SendWait("{TAB}")
-    Start-Sleep -Milliseconds 300
-
-    # Re-verify focus right before the password specifically — typing a
-    # plaintext password into whatever window stole focus in the meantime
-    # (a notification, another app) would be worse than just stopping.
-    if (-not (Wait-ForFocus -procId $proc.Id -hwnd $hwnd -maxAttempts 3 -delayMs 300)) {
-        Log "ERROR: Lost focus on the Riot Client window before entering the password - aborting"
-        Exit-Script 2
-    }
-    $escapedPwd = Escape-SendKeys -text $Password
-    [System.Windows.Forms.SendKeys]::SendWait($escapedPwd)
-    Start-Sleep -Milliseconds 300
-
-    # Enter in the wrong window could send the password as a chat message.
-    if (-not (Test-StillFocused -hwnd $hwnd)) {
-        Log "ERROR: Lost focus on the Riot Client window before submitting - aborting"
-        Exit-Script 2
-    }
-    [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
-    Log "Credentials submitted"
-}
-finally {
-    # Unlock input immediately; never leave user locked out.
-    if ($canBlock) {
-        try { [void][Win32.InputBlocker]::BlockInput($false) }
-        catch { }
-    }
-}
-
-# Wait for League to start. After pressing Enter, Riot Client authenticates
-# and is *supposed* to start League automatically since it was launched with
-# --launch-product=league_of_legends, but that auto-launch signal is
-# unreliable on its own (auth timing, patchline checks, etc.), so the trigger
-# is re-issued while polling. Only twice and with long gaps: each re-trigger
-# can pull the Riot Client window forward and interrupt someone typing a
-# verification code.
-Log "Polling for the game client launch..."
-
-$rcExe = $RiotClientPath
-if (-not ($rcExe -and (Test-Path $rcExe))) {
-    $rcProc = Get-Process -Name "RiotClientServices" -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($rcProc) {
-        try { $rcExe = $rcProc.MainModule.FileName }
-        catch { }
-    }
-}
-
-function Trigger-LeagueLaunch {
-    if ($rcExe -and (Test-Path $rcExe)) {
-        Log "Launch triggered - retrying via RiotClientServices..."
-        try { Start-Process -FilePath $rcExe -ArgumentList "--launch-product=$Product", "--launch-patchline=live" }
-        catch { Log "Launch trigger failed: $_" }
-    }
-}
-
-$leagueStarted   = $false
-$maxWaitSeconds  = 150
-$retriggerAt     = @(20, 60)
-$elapsedSeconds  = 0
-$triggerIndex    = 0
-
-while ($elapsedSeconds -lt $maxWaitSeconds) {
-    Start-Sleep -Milliseconds 500
-    $elapsedSeconds += 0.5
-
-    if (Get-Process -Name $GameProcess -ErrorAction SilentlyContinue) {
-        Log "Game client detected - done!"
-        $leagueStarted = $true
-        break
-    }
-
-    if ($triggerIndex -lt $retriggerAt.Count -and $elapsedSeconds -ge $retriggerAt[$triggerIndex]) {
-        Trigger-LeagueLaunch
-        $triggerIndex++
-    }
-}
-
-if ($leagueStarted) {
-    Log "Login script complete"
-    Exit-Script 0
-}
-else {
-    Log "The game did not auto-start after $maxWaitSeconds seconds - manual launch required"
-    Exit-Script 3
+    exit 0
+} catch {
+    exit 4
 }

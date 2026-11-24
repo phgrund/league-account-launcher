@@ -1,76 +1,30 @@
 const { app } = require('electron');
-const fs = require('fs');
+const fs = require('node:fs');
 const path = require('path');
 
-const APP_DATA_PATH = app.getPath('userData');
-
-let RESOURCES_PATH;
-if (app.isPackaged) {
-    const nested = path.join(process.resourcesPath, 'resources');
-    RESOURCES_PATH = fs.existsSync(path.join(nested, 'scripts', 'login.ps1'))
-        ? nested
-        : process.resourcesPath;
-} else {
-    RESOURCES_PATH = path.join(__dirname, '../../resources');
+const profileFiles = ['accounts.json', 'config.json', 'riot-sessions.json'];
+// Keep the full Electron profile in place for existing installs.
+const previousProfile = path.join(app.getPath('appData'), 'leaguelogin');
+const currentProfile = app.getPath('userData');
+if (!profileFiles.some(file => fs.existsSync(path.join(currentProfile, file))) &&
+    profileFiles.some(file => fs.existsSync(path.join(previousProfile, file)))) {
+    app.setPath('userData', previousProfile);
 }
+const appData = app.getPath('userData');
 
-const state = {
+module.exports = {
     mainWindow: null,
-    overlayWindow: null,
     tray: null,
-    currentAccount: null,
-    owOverlayPackage: null,
-    // Session-only (not persisted) — true once the vault password has been
-    // verified by the main process for this app run. Every account IPC checks
-    // it through services/vault.js; the renderer's lock-screen overlay alone is
-    // not a trust boundary (devtools/console can call exposed IPC methods directly).
     vaultUnlocked: false,
-
     config: {
         lolPath: 'C:\\Riot Games\\League of Legends\\LeagueClient.exe',
-        autoAccept: false,
-        overlayEnabled: false,
-        overlayShowRanked: true,
-        overlayShowBuilds: true,
-        overlayOpacity: 1.0,
-        overlayHotkey: 'Ctrl+Shift+H',
-        overlayLocked: false,
-        uiScale: 1.0,
-        game: 'lol', // which game Play starts: 'lol' or 'valorant' (top bar)
-        valorantAutoSets: false,
-        theme: 'system', // 'system' follows Windows; 'light' / 'dark' force one
-        density: 'compact', // 'roomy' gives the larger controls of 1.7
-        autoImportBuild: false, // OP.GG runes and item set once a champion is locked
-        startWithWindows: false,
+        theme: 'system',
         startMinimized: false,
-        staySignedIn: true, // tick "Stay signed in" when the password is typed
-        minimizeOnGameStart: false,
-        checkUpdatesOnStartup: true,
-        toastOnQueuePop: true,
-        discordRpcEnabled: true,
-        discordShowDetails: true, // rank, champion and queue in the Discord status
-        // The Riot API key is not kept here: it is stored encrypted as
-        // riotApiKeyEnc and read through services/secrets.js. The vault keeps
-        // vaultKdf/vaultSalt/vaultHash (scrypt); vaultPasswordHash is the
-        // unsalted SHA-256 of older versions, replaced on the first unlock.
         vaultEnabled: false,
     },
-
     paths: {
-        accounts:    path.join(APP_DATA_PATH, 'accounts.json'),
-        config:      path.join(APP_DATA_PATH, 'config.json'),
-        rankHistory: path.join(APP_DATA_PATH, 'rank-history.json'),
-        honorWatch:  path.join(APP_DATA_PATH, 'honor-watch.json'),
-        accountStatus: path.join(APP_DATA_PATH, 'account-status.json'),
-        matchStore:  path.join(APP_DATA_PATH, 'match-store.json'),
-        riotSessions: path.join(APP_DATA_PATH, 'riot-sessions.json'),
-        collection:  path.join(APP_DATA_PATH, 'collection.json'),
-        valorant:    path.join(APP_DATA_PATH, 'valorant.json'),
+        accounts: path.join(appData, 'accounts.json'),
+        config: path.join(appData, 'config.json'),
+        riotSessions: path.join(appData, 'riot-sessions.json'),
     },
-
-    RESOURCES_PATH,
-    LOL_GEP_GAME_ID:     5426,
-    LOL_OVERLAY_CLASS_ID: 54261,
 };
-
-module.exports = state;

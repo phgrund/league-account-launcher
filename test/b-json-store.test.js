@@ -1,4 +1,4 @@
-const { userData, invoke, file, writeJson, readJson } = require('./helpers/b-fakes');
+const { userData, invoke, fakeElectron, file, writeJson, readJson, legacy } = require('./helpers/b-fakes');
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
@@ -31,7 +31,10 @@ test('a damaged accounts.json is copied aside before anything overwrites it', as
     assert.equal(fs.readFileSync(file(copies[0]), 'utf8'), broken);
 
     // Saving after the copy exists is allowed; the original content survives in the copy.
-    const res = await invoke('add-account', { username: 'new', password: 'pw' });
+    const backup = file('recovery.llem');
+    fs.writeFileSync(backup, legacy.exportV1({ accounts: [{ username: 'new' }] }));
+    fakeElectron.dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [backup] });
+    const res = await invoke('import-accounts');
     assert.equal(res.success, true);
     assert.equal(readJson('accounts.json').length, 1);
     assert.equal(fs.readFileSync(file(copies[0]), 'utf8'), broken);
@@ -59,9 +62,9 @@ test('the user is told at boot which file was damaged and where the copy is', ()
     writeJson('config.json', '{"vaultEnabled": tru');
     writeJson('accounts.json', []);
     storage.loadConfig();
-    assert.throws(() => storage.migratePasswords(), /config\.json could not be read\. A copy was kept as config\.json\.corrupt-\d+/);
+    assert.throws(() => storage.checkDataFiles(), /config\.json could not be read\. A copy was kept as config\.json\.corrupt-\d+/);
     // Reported once.
-    assert.doesNotThrow(() => storage.migratePasswords());
+    assert.doesNotThrow(() => storage.checkDataFiles());
 });
 
 test('saves are flushed to disk before the rename', (t) => {

@@ -52,7 +52,10 @@ class FakeChild extends EventEmitter {
         setImmediate(() => this.emit('close', code, signal));
     }
     print(text) { this.stdout.emit('data', Buffer.from(text)); }
-    get isLoginScript() { return this.args.some(a => String(a).endsWith('login.ps1')); }
+    get isLoginScript() {
+        return !this.args.includes('-Minimize') && !this.args.includes('-PlayLeague') &&
+            this.args.some(a => String(a).endsWith('login.ps1'));
+    }
     get isPowerShellCommand() { return this.command === 'powershell.exe' && this.args.includes('-Command'); }
 }
 

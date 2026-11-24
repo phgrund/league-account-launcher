@@ -1,18 +1,18 @@
-const { ipcMain, Notification } = require('electron');
+const { dialog, ipcMain, Notification } = require('electron');
 const path = require('path');
 const fs   = require('fs');
 const os   = require('os');
-const https = require('https');
-const axios = require('../services/http');
+const { readLockfile, requestLocalClient } = require('../services/local-client');
 // Called as childProcess.spawn (not destructured) so tests can stand in a fake.
 const childProcess = require('child_process');
 const state = require('../state');
-const { loadAccounts, updateAccounts } = require('../services/storage');
-const { decrypt } = require('../services/encryption');
-const { broadcastAccountsUpdate } = require('../windows');
+const { loadAccounts, updateAccounts, sameUser } = require('../services/storage');
+const { broadcastAccountsUpdate, showMainWindow } = require('../windows');
 const lcu = require('../lcu');
 const riotSessions = require('../services/riot-sessions');
-const accountStatus = require('../services/account-status');
+const { decodeUserInfo, parseBan } = require('../services/account-status');
+const { decryptPassword } = require('../services/account-password');
+const { minimizeRiotWindow, pressLeaguePlay, submitRiotCredentials } = require('../services/credential-login');
 
 // Everything that has to be gone before another account can sign in. Current
 // Riot Client builds run their UI as "Riot Client.exe", older ones as
@@ -20,17 +20,8 @@ const accountStatus = require('../services/account-status');
 const CLIENT_PROCESS_NAMES = [
     'LeagueClient', 'LeagueClientUx', 'LeagueClientUxRender',
     'RiotClientServices', 'RiotClientUx', 'Riot Client',
-    // Valorant goes with the Riot Client it was signed in through.
-    'VALORANT-Win64-Shipping', 'VALORANT',
 ];
-// The games the app starts: the Riot Client's product id, the process that
-// shows the game came up, and its name in messages.
-const GAMES = {
-    lol:      { product: 'league_of_legends', process: 'LeagueClient', name: 'League' },
-    valorant: { product: 'valorant', process: 'VALORANT-Win64-Shipping', name: 'Valorant' },
-};
-const gameOf = (launch) => GAMES[launch?.game] || GAMES.lol;
-const LEAGUE_PROCESS_NAMES = ['LeagueClient', 'LeagueClientUx', 'LeagueClientUxRender'];
+const LEAGUE_PRODUCT = 'league_of_legends';
 
 // Phases in which restarting the clients would throw the player out of a game.
 const IN_GAME_PHASES = new Set(['ChampSelect', 'GameStart', 'InProgress', 'Reconnect']);
@@ -38,23 +29,21 @@ const IN_GAME_PHASES = new Set(['ChampSelect', 'GameStart', 'InProgress', 'Recon
 // The kill command waits up to 10 s for the processes to exit; this is the
 // outer bound for powershell.exe itself (start-up included).
 const POWERSHELL_TIMEOUT_MS = 20000;
-// After login.ps1 saw LeagueClient start, the LCU lockfile poll (every 5 s in
-// main.js) plus the client's own boot can take a while before
-// /lol-login/v1/session answers.
-const SESSION_CHECK_TIMEOUT_MS = 60000;
+// The League client can take a while to answer after sign-in.
+const SESSION_CHECK_TIMEOUT_MS = 25000;
 const SESSION_CHECK_INTERVAL_MS = 1000;
 
-const riotClientAgent = new https.Agent({ rejectUnauthorized: false });
-
-// After the sign-in, how often League is asked to start (when it has not come
-// up yet) and how long that is tried before login.ps1's own fallback is left.
-const LEAGUE_START_RETRY_MS = 12000;
-const LEAGUE_START_MAX_TRIES = 3;
-const LEAGUE_START_TIMEOUT_MS = 90000;
 const AUTH_POLL_MS = 1000;
 // How long a restored sign-in may take before the password is typed instead,
 // and how long the user has to sign in by hand (Sign in in the account panel).
 const SIGNIN_TIMEOUTS = { saved: 25000, manual: 180000 };
+const AUTO_SIGN_IN_MESSAGES = {
+    submitted: 'Waiting for Riot sign-in. Complete any verification in the Riot Client.',
+    'form-missing': 'The Riot sign-in fields were not found. Open the username and password tab and sign in.',
+    'focus-lost': 'The Riot sign-in fields did not get focus. Sign in through the Riot Client.',
+    'input-failed': 'Windows could not send text to the Riot sign-in fields. Sign in through the Riot Client.',
+    'helper-failed': 'The automatic sign-in helper stopped. Sign in through the Riot Client.',
+};
 
 function send(channel, ...args) {
     if (state.mainWindow && !state.mainWindow.isDestroyed()) {
@@ -66,10 +55,6 @@ function send(channel, ...args) {
 // storage, which requires this module's dependencies).
 function isVaultLocked() {
     return require('../services/vault').isVaultLocked();
-}
-
-function sameUsername(a, b) {
-    return typeof a === 'string' && typeof b === 'string' && a.toLowerCase() === b.toLowerCase();
 }
 
 function later(ms, fn) {
@@ -114,7 +99,8 @@ function killProcessesCommand(names) {
     const list = names.map(n => `'${n}'`).join(',');
     return `$n = @(${list}); `
         + 'Get-Process -Name $n -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue; '
-        + 'for ($i = 0; $i -lt 40 -and (Get-Process -Name $n -ErrorAction SilentlyContinue); $i++) { Start-Sleep -Milliseconds 250 }';
+        + 'for ($i = 0; $i -lt 40 -and (Get-Process -Name $n -ErrorAction SilentlyContinue); $i++) { Start-Sleep -Milliseconds 250 }; '
+        + 'if (Get-Process -Name $n -ErrorAction SilentlyContinue) { exit 1 }';
 }
 
 // Runs a PowerShell command without a console window and resolves with its
@@ -132,7 +118,10 @@ function runPowerShell(command) {
             resolve(null);
             return;
         }
-        const timer = later(POWERSHELL_TIMEOUT_MS, () => resolve(null));
+        const timer = later(POWERSHELL_TIMEOUT_MS, () => {
+            child.kill();
+            resolve(null);
+        });
         child.once('error', (e) => {
             clearTimeout(timer);
             console.error('[Launch] powershell.exe failed:', e.message);
@@ -150,13 +139,13 @@ function runPowerShell(command) {
 // and interpolating them into a shell command string is a command-injection
 // vector (a path containing `"; ...` would execute arbitrary commands).
 // Returns false when there is nothing to start; onError gets async spawn failures.
-function launchClient(riotClientPath, onError = () => {}, product = GAMES.lol.product) {
+function launchClient(riotClientPath, onError) {
     let target = null;
     let args = [];
     if (riotClientPath) {
         target = riotClientPath;
-        args = [`--launch-product=${product}`, '--launch-patchline=live'];
-    } else if (product === GAMES.lol.product && state.config.lolPath && fs.existsSync(state.config.lolPath)) {
+        args = [`--launch-product=${LEAGUE_PRODUCT}`, '--launch-patchline=live', '--allow-direct-launch'];
+    } else if (state.config.lolPath && fs.existsSync(state.config.lolPath)) {
         target = state.config.lolPath;
     }
     if (!target) return false;
@@ -174,36 +163,12 @@ function launchClient(riotClientPath, onError = () => {}, product = GAMES.lol.pr
     return true;
 }
 
-// Maps one line of login.ps1 output to a progress update, or null for lines
-// that are not a progress step (debug output, errors: those are reported
-// through the exit code instead of as "Logging in...").
-function statusForLine(line, game = 'League') {
-    if (line.includes('Waiting for Riot Client'))   return { message: 'Waiting for the Riot Client window...', progress: 55 };
-    if (line.includes('Found window'))              return { message: 'Client found, entering login...', progress: 65 };
-    if (line.includes('Credentials submitted'))     return { message: `Waiting for ${game} to start...`, progress: 80 };
-    if (line.includes('Polling for the game'))      return { message: `Waiting for ${game} to start...`, progress: 82 };
-    if (line.includes('Launch triggered'))          return { message: `Launching ${game}...`, progress: 88 };
-    if (line.includes('Game client detected'))      return { message: `${game} is starting...`, progress: 95 };
-    return null;
-}
-
-// stdout 'data' chunks can hold several lines or half of one.
-function createLineSplitter() {
-    let buffer = '';
-    return (chunk) => {
-        buffer += chunk.toString();
-        const lines = buffer.split(/\r?\n/);
-        buffer = lines.pop();
-        return lines.map(l => l.trim()).filter(Boolean);
-    };
-}
-
 // Compares the account the League client is signed in with against the one
 // that was launched. ok: null means the session could not be read.
 function verifyLoggedInAccount(expectedUsername, session) {
     const actual = session?.username;
     if (!actual) return { ok: null };
-    if (sameUsername(actual, expectedUsername)) return { ok: true };
+    if (sameUser(actual, expectedUsername)) return { ok: true };
     return { ok: false, actual };
 }
 
@@ -212,112 +177,53 @@ function riotClientLockfilePath() {
     return path.join(localAppData, 'Riot Games', 'Riot Client', 'Config', 'lockfile');
 }
 
-// A request to the Riot Client's local API (port and password from its
-// lockfile). Throws like axios; null when the client is not running.
-async function riotClientRequest(method, endpoint) {
-    let parts;
-    try {
-        parts = fs.readFileSync(riotClientLockfilePath(), 'utf8').trim().split(':');
-    } catch {
-        return null;
-    }
-    const [, , port, password, protocol] = parts;
-    if (!port || !password) return null;
-    const scheme = protocol === 'http' ? 'http' : 'https';
-    return axios({
-        method,
-        url: `${scheme}://127.0.0.1:${port}${endpoint}`,
-        auth: { username: 'riot', password },
-        httpsAgent: riotClientAgent,
-        timeout: 3000,
-    });
+async function riotClientRequest(method, endpoint, timeout) {
+    const credentials = readLockfile(riotClientLockfilePath());
+    return credentials ? requestLocalClient(credentials, method, endpoint, timeout) : null;
 }
 
-// Asks the Riot Client's local API whether someone is signed in:
-// 'signed-in', 'signed-out', or 'unknown' when the client is not reachable.
 async function riotClientAuthState() {
     try {
-        const res = await riotClientRequest('GET', '/rso-auth/v1/authorization');
-        return res ? 'signed-in' : 'unknown';
-    } catch (e) {
-        return e.response?.status === 404 ? 'signed-out' : 'unknown';
+        const response = await riotClientRequest('GET', '/rso-auth/v1/authorization');
+        if (response?.status === 404) return 'signed-out';
+        return response?.status >= 200 && response.status < 300 ? 'signed-in' : 'unknown';
+    } catch {
+        return 'unknown';
     }
 }
 
-// Starts a game the way the Riot Client's Play button does.
-async function riotClientStartProduct(product = GAMES.lol.product) {
+async function riotClientStartLeague() {
     try {
-        return !!(await riotClientRequest('POST', `/product-launcher/v1/products/${product}/patchlines/live`));
-    } catch (e) {
-        console.log(`[Launch] Riot Client did not start ${product}:`, e.response?.status || e.message);
-        return false;
+        // The installed Riot Client uses clickWallMs when the user presses Play.
+        const endpoint = `/product-launcher/v1/products/${LEAGUE_PRODUCT}/patchlines/live?clickWallMs=${Date.now()}`;
+        return await riotClientRequest('POST', endpoint, 6000);
+    } catch (error) {
+        console.log('[Launch] Riot Client could not start League:', error.message);
+        return null;
     }
 }
 
-function riotClientStartLeague() {
-    return riotClientStartProduct(GAMES.lol.product);
-}
-
-// The Riot account signed into the Riot Client: { username, info } or null.
-async function riotClientUser() {
+async function riotClientUserInfo() {
     try {
-        const info = accountStatus.decodeUserInfo((await riotClientRequest('GET', '/riot-client-auth/v1/userinfo'))?.data);
-        const username = info?.username || info?.preferred_username || info?.acct?.username || '';
-        return info ? { username: String(username), info } : null;
+        const response = await riotClientRequest('GET', '/riot-client-auth/v1/userinfo', 1800);
+        return response?.status === 200 ? decodeUserInfo(response.data) : null;
     } catch {
         return null;
     }
 }
 
-// Whether the Riot Client reports a running Valorant session.
-async function valorantRunning() {
-    try {
-        const sessions = (await riotClientRequest('GET', '/product-session/v1/external-sessions'))?.data;
-        return !!sessions && Object.values(sessions).some((s) => s?.productId === GAMES.valorant.product);
-    } catch {
-        return false;
-    }
-}
-
-// After the credentials are in, the Riot Client often stays on its home page
-// instead of starting League (its --launch-product start is unreliable once
-// the sign-in takes a moment). As soon as it reports a signed-in player, ask
-// it to start League, and again while League has not come up. Ends when
-// login.ps1 sees League (the script exits), on cancel, or after the timeout.
-// Nothing is asked before the sign-in finished, so a verification code or a
-// captcha is never interrupted.
-async function startLeagueAfterSignIn(launch) {
-    const deadline = Date.now() + LEAGUE_START_TIMEOUT_MS;
-    let tries = 0;
-    let lastTry = 0;
-    while (isCurrent(launch) && launch.child && Date.now() < deadline && tries < LEAGUE_START_MAX_TRIES) {
-        if (Date.now() - lastTry >= LEAGUE_START_RETRY_MS && await riotClientAuthState() === 'signed-in') {
-            if (!isCurrent(launch) || !launch.child) return;
-            if (!launch.banChecked) {
-                launch.banChecked = true;
-                if (await checkBan(launch)) return;
-            }
-            lastTry = Date.now();
-            tries++;
-            if (await riotClientStartProduct(gameOf(launch).product)) status(launch, `Launching ${gameOf(launch).name}...`, 88);
-        }
-        await sleep(AUTH_POLL_MS);
-    }
-}
-
-// ── Launch state ────────────────────────────────────────────────────────────
-// One launch at a time. Every step after an await re-checks that its launch is
-// still the active one, so Cancel works in every phase and a cancelled flow
-// never spawns the login script or types credentials.
+// Serialize switches so only one launch can change the Riot Client's session.
 let launchSeq = 0;
-let activeLaunch = null; // { seq, username, label, child, hidWindow, progress }
+let activeLaunch = null;
+let closingClients = false;
+let launchAfterUnlock = null;
 
 function isCurrent(launch) {
     return activeLaunch === launch;
 }
 
 function isLaunchInProgress() {
-    return activeLaunch !== null;
+    return activeLaunch !== null || closingClients;
 }
 
 // True while a launch has hidden the main window (minimize on launch), so the
@@ -333,7 +239,7 @@ function status(launch, message, progress, extra = {}) {
     send('login-status', { message, progress: launch.progress, ...extra });
 }
 
-// Clears the overlay after a finished launch unless a newer one started since.
+// Clears the progress status after a finished launch unless a newer one started.
 function clearStatusLater(ms) {
     const seq = launchSeq;
     later(ms, () => {
@@ -353,14 +259,6 @@ function notify(title, body) {
     } catch { /* notifications may not be supported in this environment */ }
 }
 
-function showMainWindow() {
-    const win = state.mainWindow;
-    if (!win || win.isDestroyed()) return;
-    win.show();
-    if (win.isMinimized?.()) win.restore();
-    win.focus();
-}
-
 // Brings the window back for a message the user has to see (minimize on
 // launch would otherwise leave it hidden), with a notification if it was hidden.
 function revealWindow(title, message) {
@@ -374,9 +272,7 @@ function revealWindow(title, message) {
 function fail(launch, message, kind) {
     if (!isCurrent(launch)) return;
     activeLaunch = null;
-    if (launch.child) {
-        try { launch.child.kill(); } catch { /* already gone */ }
-    }
+    launch.controller.abort();
     send('login-status', { message, progress: 0, error: true, kind });
     revealWindow('Login did not complete', message);
     clearStatusLater(5000);
@@ -384,6 +280,7 @@ function fail(launch, message, kind) {
 
 function succeed(launch, message) {
     if (!isCurrent(launch)) return;
+    broadcastAccountsUpdate();
     send('login-status', { message, progress: 100, kind: 'done' });
     activeLaunch = null;
     clearStatusLater(3000);
@@ -394,77 +291,18 @@ function succeed(launch, message) {
 async function waitForSession(launch) {
     const deadline = Date.now() + SESSION_CHECK_TIMEOUT_MS;
     while (isCurrent(launch) && Date.now() < deadline) {
-        if (lcu.connected) {
-            const session = await lcu.request('GET', '/lol-login/v1/session', null, { timeout: 3000 });
-            if (session?.username) return session;
-        }
+        const session = await lcu.request('GET', '/lol-login/v1/session');
+        if (session?.username) return session;
         await sleep(SESSION_CHECK_INTERVAL_MS);
     }
     return null;
 }
 
-const NEEDS_ACTION_MESSAGES = {
-    'signed-out': 'Sign-in did not complete. Check the Riot Client: wrong password, a verification code or a captcha?',
-    'signed-in':  'Signed in, but League did not start. Click Play in the Riot Client.',
-    'unknown':    'League did not start. Finish signing in or click Play in the Riot Client.',
-};
-
-async function onLoginScriptExit(launch, code, signal) {
-    if (!isCurrent(launch)) return; // cancelled: the user already got login-status null
-    launch.child = null;
-
-    if (code === 0) {
-        status(launch, 'Checking the signed-in account...', 98);
-        const check = verifyLoggedInAccount(launch.username, launch.game === 'valorant'
-            ? await riotClientUser()
-            : await waitForSession(launch));
-        if (!isCurrent(launch)) return;
-        if (check.ok === false) {
-            fail(launch, `Signed in as ${check.actual}, not ${launch.label}. Sign out in the Riot Client and try again.`, 'wrong-account');
-            return;
-        }
-        if (check.ok) riotSessions.captureSignIn(launch.username);
-        succeed(launch, 'Done!');
-        notify(`${gameOf(launch).name} Launched!`, `${launch.label} is ready to play.`);
-        afterValorantSignIn(launch);
-        return;
-    }
-
-    // League never came up: wrong password, 2FA, captcha, or keystrokes that
-    // reached the client before its UI was ready all end here.
-    if (code === 3) {
-        const auth = await riotClientAuthState();
-        fail(launch, NEEDS_ACTION_MESSAGES[auth] || NEEDS_ACTION_MESSAGES.unknown, 'needs-action');
-        return;
-    }
-
-    let message;
-    if (code === 1) message = 'The Riot Client window did not appear. Start the Riot Client and try again.';
-    else if (code === 2) message = 'Could not bring the Riot Client window to the front. Click it and try again.';
-    else if (code === 5) message = 'The login stopped because of an unexpected error. Try again; details are in %TEMP%\\leaguelogin_debug.txt.';
-    else if (code === null) message = `The login was interrupted${signal ? ` (${signal})` : ''}. Try again.`;
-    else message = 'Login failed. Check the Riot Client window and try again.';
-    fail(launch, message, 'failed');
-}
-
 // Once the Riot Client is signed in: reads whether the account is banned,
-// stores it for the list, and stops the launch while a ban runs (League
-// would only show its ban screen). Returns true when the launch stopped.
-async function checkBan(launch) {
-    let info;
-    try {
-        info = (await riotClientRequest('GET', '/riot-client-auth/v1/userinfo'))?.data;
-    } catch {
-        return false; // no user info: nothing known, the launch goes on
-    }
-    const valorant = launch.game === 'valorant';
-    const ban = accountStatus.parseBan(info, valorant ? ['valorant', 'riot'] : undefined);
-    if (ban === undefined || !isCurrent(launch)) return false;
-    // The list shows League bans; a Valorant ban only stops this launch.
-    if (!valorant) {
-        accountStatus.recordBan(launch.username, ban);
-        broadcastAccountsUpdate();
-    }
+// and stops the launch while a ban runs.
+function checkBan(launch, info) {
+    const ban = parseBan(info);
+    if (!isCurrent(launch)) return false;
     if (!ban || (!ban.permanent && ban.until <= Date.now())) return false;
     fail(launch, ban.permanent
         ? `${launch.label} is permanently banned.`
@@ -483,109 +321,105 @@ async function waitForSignIn(launch, timeoutMs) {
     return false;
 }
 
-// Valorant has no League client to ask: the Riot Client says who is signed
-// in, and its session list shows when Valorant is up. Polls until then, the
-// launch is cancelled or the timeout passes (false).
-async function waitForValorant(launch) {
-    const deadline = Date.now() + SESSION_CHECK_TIMEOUT_MS;
-    while (isCurrent(launch) && Date.now() < deadline) {
-        if (await valorantRunning()) return true;
-        await sleep(SESSION_CHECK_INTERVAL_MS);
-    }
-    return false;
-}
-
-// After a Valorant sign-in: read rank, store, wallet and inventory in the
-// background; nothing waits for it.
-function afterValorantSignIn(launch) {
-    if (launch.game !== 'valorant') return;
-    require('../services/valorant').captureForAccount(launch.username)
-        .then((ok) => { if (ok) broadcastAccountsUpdate(); })
-        .catch((e) => console.log('[Valorant] Capture after sign-in skipped:', e.message));
-}
-
-async function finishSignedInValorant(launch) {
-    status(launch, 'Launching Valorant...', 88);
-    await riotClientStartProduct(GAMES.valorant.product);
-    const check = verifyLoggedInAccount(launch.username, await riotClientUser());
-    if (!isCurrent(launch)) return;
-    if (check.ok === false) {
-        riotSessions.forgetSignIn(launch.username);
-        fail(launch, `Signed in as ${check.actual}, not ${launch.label}. Sign out in the Riot Client and try again.`, 'wrong-account');
-        return;
-    }
-    let up = await waitForValorant(launch);
-    if (!up && isCurrent(launch)) {
-        await riotClientStartProduct(GAMES.valorant.product);
-        up = await waitForValorant(launch);
-    }
-    if (!isCurrent(launch)) return;
-    if (!up) {
-        fail(launch, 'Signed in, but Valorant did not start. Click Play in the Riot Client.', 'needs-action');
-        return;
-    }
-    const kept = riotSessions.captureSignIn(launch.username);
-    succeed(launch, launch.manual && !kept
-        ? 'Signed in. "Stay signed in" was not ticked, so the password is typed next time.'
-        : 'Done!');
-    notify('Valorant Launched!', `${launch.label} is ready to play.`);
-    afterValorantSignIn(launch);
-}
-
 // After a sign-in without typing: start League, check the account in the
 // League client and keep the (refreshed) sign-in for next time.
-async function finishSignedIn(launch) {
-    if (await checkBan(launch)) return;
-    if (launch.game === 'valorant') return finishSignedInValorant(launch);
-    status(launch, 'Launching League...', 88);
-    await riotClientStartLeague();
-    let session = null;
-    for (let i = 0; i < 2 && isCurrent(launch) && !session; i++) {
-        session = await waitForSession(launch);
-        if (!session && isCurrent(launch)) await riotClientStartLeague();
+async function finishSignedIn(launch, restored = false, knownUserInfo = null) {
+    const info = knownUserInfo ?? await riotClientUserInfo();
+    if (!isCurrent(launch) || checkBan(launch, info)) return;
+    const signedInUser = info?.preferred_username ?? info?.username;
+    if (typeof signedInUser === 'string' && signedInUser && !sameUser(signedInUser, launch.username)) {
+        if (restored) riotSessions.forgetSignIn(launch.username);
+        broadcastAccountsUpdate();
+        fail(launch, `Riot is signed in as ${signedInUser}, not ${launch.label}. Choose the correct account in the Riot Client.`, 'wrong-account');
+        return;
+    }
+    let session = await lcu.request('GET', '/lol-login/v1/session');
+    if (!isCurrent(launch)) return;
+    if (!session?.username) {
+        status(launch, 'Launching League...', 88);
+        const play = await riotClientStartLeague();
+        if (!isCurrent(launch)) return;
+        let accepted = play && ((play.status >= 200 && play.status < 300) || play.status === 409);
+        // A cold launch can already hold the product launch lock while League starts.
+        if (launch.requestedDirectLaunch && play?.status === 423) accepted = true;
+        if (!accepted) {
+            session = await lcu.request('GET', '/lol-login/v1/session');
+            if (!isCurrent(launch)) return;
+        }
+        if (!session?.username && play?.status === 464) {
+            status(launch, 'Pressing League Play in the Riot Client...', 90);
+            accepted = await pressLeaguePlay(launch.riotClientPath, launch.controller.signal);
+            if (!isCurrent(launch)) return;
+        }
+        // Play can disappear as soon as League starts, before its session is readable.
+        if (!session?.username && (accepted || play?.status === 464)) {
+            status(launch, 'Waiting for League to open...', 92);
+            session = await waitForSession(launch);
+            if (!isCurrent(launch)) return;
+        }
+        if (!accepted && !session?.username) {
+            const detail = play?.status ? ` (HTTP ${play.status})` : '';
+            const reason = play?.status === 464
+                ? 'The manager could not find an enabled League Play button in the Riot Client.'
+                : `Riot could not start League${detail}.`;
+            fail(launch, `${reason} Open the League page in the Riot Client to check Play or any pending update.`, 'needs-action');
+            return;
+        }
     }
     if (!isCurrent(launch)) return;
     const check = verifyLoggedInAccount(launch.username, session);
     if (check.ok === false) {
-        // The saved sign-in belongs to someone else: never use it again.
-        riotSessions.forgetSignIn(launch.username);
+        if (restored) {
+            riotSessions.forgetSignIn(launch.username);
+            broadcastAccountsUpdate();
+        }
         fail(launch, `Signed in as ${check.actual}, not ${launch.label}. Sign out in the Riot Client and try again.`, 'wrong-account');
         return;
     }
     if (check.ok === null) {
-        fail(launch, NEEDS_ACTION_MESSAGES['signed-in'], 'needs-action');
+        fail(launch, 'League did not report a session after Play. Check the Riot Client for an update or error.', 'needs-action');
         return;
     }
-    const kept = riotSessions.captureSignIn(launch.username);
-    succeed(launch, launch.manual && !kept
-        ? 'Signed in. "Stay signed in" was not ticked, so the password is typed next time.'
-        : 'Done!');
+    const kept = await riotSessions.captureSignIn(launch.username, () => isCurrent(launch));
+    if (!isCurrent(launch)) return;
+    succeed(launch, kept ? 'Session saved.' : 'Signed in. Tick "Stay signed in" to save the session next time.');
+    minimizeRiotWindow(launch.riotClientPath);
     notify('League Launched!', `${launch.label} is ready to play.`);
 }
 
-// The Riot Client starts with this account's saved sign-in. When it is not
-// signed in after a short wait (the sign-in expired or was revoked), the
-// saved copy is dropped and the password is typed instead.
-async function signInWithSaved(launch, account, password, riotClientPath, notBefore) {
-    status(launch, 'Signing in with the saved sign-in...', 60);
-    if (await waitForSignIn(launch, SIGNIN_TIMEOUTS.saved)) {
-        await finishSignedIn(launch);
-        return;
+async function signIn(launch, { restored, manual, clientPath, startedAt }) {
+    let message = 'Sign in in the Riot Client and tick "Stay signed in".';
+    if (restored) {
+        status(launch, 'Opening the saved session...', 55);
+        if (await waitForSignIn(launch, SIGNIN_TIMEOUTS.saved)) {
+            await finishSignedIn(launch, true);
+            return;
+        }
+        if (!isCurrent(launch)) return;
+        riotSessions.forgetSignIn(launch.username);
+        broadcastAccountsUpdate();
+        message = 'Session expired. Sign in again in the Riot Client and tick "Stay signed in".';
     }
-    if (!isCurrent(launch)) return;
-    riotSessions.forgetSignIn(launch.username);
-    if (!password) {
-        fail(launch, 'The saved sign-in expired. Click Sign in in the account panel, or save the password for this account.', 'needs-action');
-        return;
-    }
-    status(launch, 'The saved sign-in expired. Typing the password...', 62);
-    startLoginScript(launch, account, password, riotClientPath, notBefore);
-}
 
-// Sign in (account panel): the user signs in in the Riot Client (with "Stay signed
-// in" ticked); the app starts League and keeps that sign-in for next time.
-async function signInByHand(launch) {
-    status(launch, 'Sign in to this account in the Riot Client and tick "Stay signed in".', 55);
+    if (!manual && clientPath) {
+        const account = loadAccounts().find(candidate => sameUser(candidate.username, launch.username));
+        if (account?.encryptedPassword) {
+            const password = await decryptPassword(account.encryptedPassword);
+            if (!isCurrent(launch)) return;
+            if (password) {
+                status(launch, 'Signing in through the Riot Client...', 60);
+                const result = await submitRiotCredentials({
+                    username: launch.username, password, clientPath, startedAt, signal: launch.controller.signal,
+                });
+                message = AUTO_SIGN_IN_MESSAGES[result];
+            } else {
+                message = 'Windows could not unlock the saved password. Sign in through Riot or update it under Edit.';
+            }
+        }
+    }
+
+    if (!isCurrent(launch)) return;
+    status(launch, message, 60);
     if (await waitForSignIn(launch, SIGNIN_TIMEOUTS.manual)) {
         await finishSignedIn(launch);
         return;
@@ -593,187 +427,116 @@ async function signInByHand(launch) {
     if (isCurrent(launch)) fail(launch, 'No sign-in in the Riot Client. Try again when you are ready.', 'needs-action');
 }
 
-function startLoginScript(launch, account, password, riotClientPath, notBefore) {
-    const loginScriptPath = path.join(state.RESOURCES_PATH, 'scripts', 'login.ps1');
-
-    // Password is sent over stdin rather than as a command-line argument:
-    // process argv is readable by other local processes/users for the life of
-    // the child (e.g. Task Manager's "Command line" column). Base64 because
-    // Windows PowerShell decodes console input with the OEM code page, which
-    // garbled every non-ASCII character (ä, ß, €).
-    const child = childProcess.spawn('powershell.exe', [
-        '-NoProfile',
-        '-ExecutionPolicy', 'Bypass',
-        '-File', loginScriptPath,
-        '-Username', account.username,
-        '-RiotClientPath', riotClientPath || '',
-        '-NotBefore', String(notBefore),
-        '-Product', gameOf(launch).product,
-        '-GameProcess', gameOf(launch).process,
-        // Ticked, the sign-in is kept (riotSessions.captureSignIn) and the
-        // next launch of this account skips typing.
-        ...(state.config.staySignedIn !== false ? ['-StaySignedIn'] : []),
-    ], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
-    launch.child = child;
-
-    child.on('error', (e) => {
-        console.error('[Launch] Login script failed to start:', e.message);
-        fail(launch, 'The login script could not start (powershell.exe). Try again.', 'failed');
-    });
-    child.stdin.on('error', (e) => console.error('[Launch] Login script stdin:', e.message));
-    child.stdin.write(Buffer.from(password, 'utf8').toString('base64') + '\n');
-    child.stdin.end();
-
-    const splitLines = createLineSplitter();
-    child.stdout.on('data', (data) => {
-        for (const line of splitLines(data)) {
-            console.log('[Login Script]:', line);
-            const step = statusForLine(line, gameOf(launch).name);
-            if (step && step.progress >= launch.progress) status(launch, step.message, step.progress);
-            if (line.includes('Credentials submitted') && !launch.startingLeague) {
-                launch.startingLeague = true;
-                startLeagueAfterSignIn(launch).catch(e => console.log('[Launch] League start after sign-in:', e.message));
-            }
-        }
-    });
-    child.stderr.on('data', (data) => {
-        console.error('[Login Script stderr]:', data.toString());
-    });
-    child.on('close', (code, signal) => {
-        onLoginScriptExit(launch, code, signal)
-            .catch(e => fail(launch, `Login failed: ${e.message}`, 'failed'));
-    });
-}
-
 const CANCELLED = Object.freeze({ success: false, cancelled: true });
 
 async function executeAccountLaunch(username, opts = {}) {
     if (isVaultLocked()) return { success: false, locked: true, message: 'Vault is locked' };
-    if (activeLaunch) return { success: false, busy: true, message: 'A launch is already in progress' };
+    if (isLaunchInProgress()) return { success: false, busy: true, message: 'A launch is already in progress' };
 
     const accounts = loadAccounts();
-    const idx = accounts.findIndex(a => a.username === username);
-    if (idx < 0) return { success: false, message: 'Account not found' };
-    const account = accounts[idx];
-
-    // Checked before hiding the window: with minimizeOnLaunch on, failing
-    // after the hide left the user with no visible window or error.
-    const manual = !!opts.manual;
-    const password = decrypt(account.password);
-    if (!password && !manual && !riotSessions.hasSignIn(account.username)) {
-        // Usually means this password was encrypted under a key tied to
-        // machine state that's since changed (e.g. a Windows update removing
-        // wmic): the ciphertext can't be recovered, but re-saving the
-        // password re-encrypts it under the current key.
-        return { success: false, message: 'Saved password could not be read (often after a Windows update). Edit this account, re-enter its password and try again.' };
-    }
+    const account = accounts.find(a => sameUser(a.username, username));
+    if (!account) return { success: false, message: 'Account not found' };
 
     const launch = {
-        seq: ++launchSeq,
         username: account.username,
         label: account.label || account.username,
-        child: null,
         hidWindow: false,
         progress: 0,
-        manual,
-        // Which game Play starts: the one picked in the top bar, or League.
-        game: GAMES[opts.game] ? opts.game : (GAMES[state.config.game] ? state.config.game : 'lol'),
+        controller: new AbortController(),
     };
-    // Claimed before the first await: a second launch (tray, jump list,
-    // another click) now gets `busy` instead of running in parallel and
-    // typing a second account into the same Riot Client.
+    // Claim before waiting for the running client to respond.
+    launchSeq++;
     activeLaunch = launch;
 
     try {
-        // Valorant: already running for this account, nothing to do.
-        if (launch.game === 'valorant' && await valorantRunning()) {
-            const user = await riotClientUser();
+        const [session, phase] = await Promise.all([
+            lcu.request('GET', '/lol-login/v1/session'),
+            lcu.request('GET', '/lol-gameflow/v1/gameflow-phase'),
+        ]);
+        if (!isCurrent(launch)) return CANCELLED;
+        if (sameUser(session?.username, account.username)) {
+            updateAccounts((fresh) => {
+                const current = fresh.find(a => sameUser(a.username, account.username));
+                if (!current) return false;
+                current.lastUsed = Date.now();
+            });
+            const kept = await riotSessions.captureSignIn(account.username, () => isCurrent(launch));
             if (!isCurrent(launch)) return CANCELLED;
-            if (sameUsername(user?.username, account.username)) {
+            succeed(launch, kept ? 'Session saved.' : 'Already signed in. Tick "Stay signed in" to save the session next time.');
+            return { success: true };
+        }
+        if (IN_GAME_PHASES.has(phase) && !opts.confirmed) {
+            activeLaunch = null;
+            return { success: false, needsConfirm: true, message: 'You are in a game. Launching another account closes League.' };
+        }
+        const riotClientPath = discoverRiotClientPath();
+        launch.riotClientPath = riotClientPath;
+        if (!opts.manual && !session?.username && !IN_GAME_PHASES.has(phase)) {
+            const info = await riotClientUserInfo();
+            if (!isCurrent(launch)) return CANCELLED;
+            const username = info?.preferred_username ?? info?.username;
+            if (sameUser(username, account.username)) {
                 updateAccounts((fresh) => {
-                    const current = fresh.find(a => sameUsername(a.username, account.username));
+                    const current = fresh.find(a => sameUser(a.username, account.username));
                     if (!current) return false;
                     current.lastUsed = Date.now();
                 });
-                broadcastAccountsUpdate();
-                send('launch-account-info', accountMeta(account));
-                succeed(launch, 'Already logged in!');
-                afterValorantSignIn(launch);
+                if (account.minimizeOnLaunch && state.mainWindow && !state.mainWindow.isDestroyed()) {
+                    state.mainWindow.hide();
+                    launch.hidWindow = true;
+                }
+                finishSignedIn(launch, false, info).catch(error => fail(launch, `Login failed: ${error.message}`, 'failed'));
                 return { success: true };
             }
         }
-        if (lcu.connected) {
-            const [session, phase] = await Promise.all([
-                lcu.request('GET', '/lol-login/v1/session', null, { timeout: 3000 }),
-                lcu.request('GET', '/lol-gameflow/v1/gameflow-phase', null, { timeout: 3000 }),
-            ]);
+        if (!riotClientPath && !fs.existsSync(state.config.lolPath)) {
+            const message = 'Could not find the Riot Client or League of Legends. Set the path in Settings.';
+            fail(launch, message, 'failed');
+            return { success: false, message, reported: true };
+        }
+        if (session?.username && accounts.some(a => sameUser(a.username, session.username))) {
+            await riotSessions.captureSignIn(session.username, () => isCurrent(launch));
             if (!isCurrent(launch)) return CANCELLED;
-            if (launch.game === 'lol' && sameUsername(session?.username, account.username)) {
-                updateAccounts((fresh) => {
-                    const current = fresh.find(a => sameUsername(a.username, account.username));
-                    if (!current) return false;
-                    current.lastUsed = Date.now();
-                });
-                broadcastAccountsUpdate();
-                send('launch-account-info', accountMeta(account));
-                succeed(launch, 'Already logged in!');
-                return { success: true };
-            }
-            if (IN_GAME_PHASES.has(phase) && !opts.confirmed) {
-                activeLaunch = null;
-                return { success: false, needsConfirm: true, message: 'You are in a game. Launching another account closes League.' };
-            }
-            // The signed-in account's sign-in is the freshest copy there is:
-            // keep it before the clients close (only for saved accounts).
-            if (session?.username && accounts.some(a => sameUsername(a.username, session.username))) {
-                riotSessions.captureSignIn(session.username);
-            }
         }
 
         updateAccounts((fresh) => {
-            const current = fresh.find(a => sameUsername(a.username, account.username));
+            const current = fresh.find(a => sameUser(a.username, account.username));
             if (!current) return false; // deleted meanwhile: don't bring it back
             current.lastUsed = Date.now();
         });
         broadcastAccountsUpdate();
-        send('launch-account-info', accountMeta(account));
 
         if (account.minimizeOnLaunch && state.mainWindow && !state.mainWindow.isDestroyed()) {
             state.mainWindow.hide();
             launch.hidWindow = true;
         }
-        status(launch, 'Closing the games and the Riot Client...', 10);
-        await runPowerShell(killProcessesCommand(CLIENT_PROCESS_NAMES));
+        status(launch, 'Closing League and the Riot Client...', 10);
+        closingClients = true;
+        const closeResult = await runPowerShell(killProcessesCommand(CLIENT_PROCESS_NAMES));
+        closingClients = false;
         if (!isCurrent(launch)) return CANCELLED;
-
-        // The Riot Client reads its kept sign-in at start: put this account's
-        // in place (or clear another account's) while it is closed.
-        const restored = riotSessions.restoreSignIn(manual ? null : account.username);
-
-        status(launch, 'Launching Riot Client...', 30);
-        const riotClientPath = discoverRiotClientPath();
-        // The login script only accepts Riot Client windows created after this
-        // point, never one that survived the kill above.
-        const notBefore = Date.now();
-        const started = launchClient(riotClientPath, (e) =>
-            fail(launch, `Could not start the Riot Client (${e.code || e.message}).`, 'failed'), gameOf(launch).product);
-        if (!started) {
-            const message = launch.game === 'valorant'
-                ? 'Could not find the Riot Client. Install Valorant or start the Riot Client once.'
-                : 'Could not find the Riot Client or League of Legends. Set the path in Settings.';
+        if (closeResult !== 0) {
+            const message = 'Could not close League or the Riot Client. Close them and try again.';
             fail(launch, message, 'failed');
             return { success: false, message, reported: true };
         }
 
-        if (manual) {
-            signInByHand(launch).catch(e => fail(launch, `Login failed: ${e.message}`, 'failed'));
-        } else if (restored) {
-            signInWithSaved(launch, account, password, riotClientPath, notBefore)
-                .catch(e => fail(launch, `Login failed: ${e.message}`, 'failed'));
-        } else {
-            status(launch, 'Waiting for the Riot Client window...', 50);
-            startLoginScript(launch, account, password, riotClientPath, notBefore);
+        // The Riot Client reads its kept sign-in at start: put this account's
+        // in place (or clear another account's) while it is closed.
+        const restored = await riotSessions.restoreSignIn(opts.manual ? null : account.username, launch.controller.signal);
+        if (!isCurrent(launch)) return CANCELLED;
+
+        status(launch, 'Launching Riot Client...', 30);
+        const startedAt = Date.now();
+        launch.requestedDirectLaunch = Boolean(riotClientPath);
+        const started = launchClient(riotClientPath, (e) =>
+            fail(launch, `Could not start the Riot Client (${e.code || e.message}).`, 'failed'));
+        if (!started || !isCurrent(launch)) {
+            return { success: false, reported: true };
         }
+
+        signIn(launch, { restored, manual: opts.manual, clientPath: riotClientPath, startedAt })
+            .catch(error => fail(launch, `Login failed: ${error.message}`, 'failed'));
         return { success: true };
     } catch (e) {
         console.error('[Launch] Unexpected error:', e);
@@ -784,21 +547,10 @@ async function executeAccountLaunch(username, opts = {}) {
     }
 }
 
-function accountMeta(account) {
-    return {
-        label:    account.label || account.username,
-        username: account.username,
-        region:   (account.region || '').toUpperCase(),
-    };
-}
-
 function cancelLaunch() {
-    const launch = activeLaunch;
-    if (!launch) return { success: false, message: 'No launch in progress' };
+    if (!activeLaunch) return { success: false, message: 'No launch in progress' };
+    activeLaunch.controller.abort();
     activeLaunch = null;
-    if (launch.child) {
-        try { launch.child.kill(); } catch { /* already gone */ }
-    }
     send('login-status', null);
     return { success: true };
 }
@@ -807,15 +559,29 @@ function cancelLaunch() {
 // the window (lock screen, error) is shown here instead.
 async function launchFromOutside(username) {
     if (isVaultLocked()) {
+        launchAfterUnlock = username;
         showMainWindow();
         return { success: false, locked: true, message: 'Vault is locked' };
     }
     const win = state.mainWindow;
     const wasHidden = !!win && !win.isDestroyed() && !win.isVisible();
-    const account = loadAccounts().find(a => a.username === username);
+    const account = loadAccounts().find(a => sameUser(a.username, username));
     if (!account?.minimizeOnLaunch) showMainWindow();
 
-    const res = await executeAccountLaunch(username);
+    let res = await executeAccountLaunch(username);
+    if (res.needsConfirm) {
+        showMainWindow();
+        const { response } = await dialog.showMessageBox(win, {
+            type: 'warning',
+            message: res.message,
+            buttons: ['Cancel', 'Switch account'],
+            defaultId: 0,
+            cancelId: 0,
+            noLink: true,
+        });
+        if (response !== 1) return { success: false, cancelled: true };
+        res = await executeAccountLaunch(username, { confirmed: true });
+    }
     if (res.busy) {
         showMainWindow(); // the running launch's progress is on screen
     } else if (!res.success && !res.cancelled && !res.reported) {
@@ -827,48 +593,33 @@ async function launchFromOutside(username) {
     return res;
 }
 
+function resumeExternalLaunch() {
+    if (!launchAfterUnlock || isVaultLocked()) return;
+    const username = launchAfterUnlock;
+    launchAfterUnlock = null;
+    return launchFromOutside(username);
+}
+
 function register() {
     ipcMain.handle('launch-account', (event, username, opts) =>
         executeAccountLaunch(username, {
             confirmed: !!opts?.confirmed,
             manual: !!opts?.manual,
-            game: opts?.game === 'valorant' || opts?.game === 'lol' ? opts.game : undefined,
         }));
 
-    // Plain "open the client" for the Live page's empty state: no account
-    // login, just gets League/Riot Client running so the LCU can connect.
-    ipcMain.handle('launch-league-client', () => {
-        if (launchClient(discoverRiotClientPath())) return { success: true };
-        return { success: false, message: 'Could not find Riot Client or League of Legends. Set the path in Settings.' };
-    });
-
     ipcMain.handle('cancel-launch', () => cancelLaunch());
-
-    // The signed-in login name is account data: hidden while the vault is locked.
-    ipcMain.handle('get-current-account', () => (isVaultLocked() ? null : state.currentAccount?.username ?? null));
 }
 
 module.exports = {
     register,
     executeAccountLaunch,
     launchFromOutside,
+    resumeExternalLaunch,
     cancelLaunch,
     isLaunchInProgress,
     isWindowHiddenByLaunch,
     isVaultLocked,
     riotClientFromInstallsJson,
-    riotClientAuthState,
-    riotClientStartLeague,
-    riotClientStartProduct,
-    riotClientRequest,
-    riotClientUser,
-    valorantRunning,
-    GAMES,
-    statusForLine,
     verifyLoggedInAccount,
-    killProcessesCommand,
-    runPowerShell,
-    CLIENT_PROCESS_NAMES,
-    LEAGUE_PROCESS_NAMES,
     SIGNIN_TIMEOUTS,
 };

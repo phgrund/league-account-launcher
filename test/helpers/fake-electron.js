@@ -12,6 +12,7 @@ const fakeElectron = {
     app: {
         isPackaged: false,
         getPath: () => userData,
+        getAppPath: () => path.resolve(__dirname, '../..'),
         getLoginItemSettings: () => ({ openAtLogin: false }),
         setLoginItemSettings: () => {},
         getVersion: () => '0.0.0-test',
@@ -24,7 +25,7 @@ const fakeElectron = {
     },
     nativeTheme: { themeSource: 'system', shouldUseDarkColors: false },
     shell: { openExternal: async () => {} },
-    dialog: {},
+    dialog: { showSaveDialog: async () => ({ canceled: true }) },
     screen: { getPrimaryDisplay: () => ({ workAreaSize: { width: 1920, height: 1080 } }) },
     Notification: class { on() {} show() {} },
     BrowserWindow: class { static getAllWindows() { return []; } },

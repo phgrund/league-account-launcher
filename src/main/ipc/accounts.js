@@ -1,61 +1,22 @@
 const { ipcMain, dialog } = require('electron');
 const fs = require('fs');
 const { loadAccounts, saveAccounts, sameUser } = require('../services/storage');
-const { encrypt, decrypt, encryptExport, decryptExport, decryptExportV1, backupVersion } = require('../services/encryption');
+const { encryptExport, decryptExport, decryptExportV1, backupVersion } = require('../services/encryption');
+const { encryptPassword } = require('../services/account-password');
+const { createAccountShortcut } = require('../services/account-shortcut');
 const { broadcastAccountsUpdate } = require('../windows');
-const { loadHonorWatch, getHonorRecord, isFlaggedRecord, forgetHonor } = require('../services/honor-watch');
-const { getStatusMap, statusFor, forgetStatus } = require('../services/account-status');
 const vault = require('../services/vault');
 const state = require('../state');
+const riotSessions = require('../services/riot-sessions');
 
-// Tags: trimmed, inner spaces collapsed, at most MAX_TAGS of MAX_TAG_LENGTH
-// characters, the first spelling of a tag kept when it repeats in other case.
-const MAX_TAGS = 8;
-const MAX_TAG_LENGTH = 24;
-function normalizeBanUntil(text) {
-    const t = Date.parse(String(text || '').trim());
-    return Number.isFinite(t) ? new Date(t).toISOString() : '';
-}
-
-function normalizeTags(text) {
-    const seen = new Set();
-    const out = [];
-    for (const raw of String(text).split(',')) {
-        const tag = raw.replace(/\s+/g, ' ').trim().slice(0, MAX_TAG_LENGTH).trim();
-        const key = tag.toLowerCase();
-        if (!tag || seen.has(key)) continue;
-        seen.add(key);
-        out.push(tag);
-        if (out.length === MAX_TAGS) break;
-    }
-    return out.join(', ');
-}
-
-// Fields an account record may carry besides username/password, with their
-// type and the default for a new record. add-account, update-account, import
-// and export all go through this list, so internal fields (_cachedStats,
-// lastUsed, passwordOk, ...) never come in from a backup or the renderer.
-const STRING_MAX = 2048;
+// Account identity fields supported by existing backups.
 const ACCOUNT_FIELDS = {
-    label:            { type: 'string',  def: '', max: 200 },
-    riotId:           { type: 'string',  def: '', max: 100 },
-    region:           { type: 'string',  def: '', max: 16 },
-    notes:            { type: 'string',  def: '', max: 5000 },
-    appearOffline:    { type: 'boolean', def: false },
-    autoSkinRandom:   { type: 'boolean', def: false },
+    label: { type: 'string', def: '', max: 200 },
+    riotId: { type: 'string', def: '', max: 100 },
+    region: { type: 'string', def: '', max: 16 },
     minimizeOnLaunch: { type: 'boolean', def: false },
-    isFavourite:      { type: 'boolean', def: false },
-    customRank:       { type: 'string',  def: '', max: 100 },
-    customAvatar:     { type: 'string',  def: '', max: STRING_MAX },
-    goalRank:         { type: 'string',  def: '', max: 32 },
-    // Comma-separated, cleaned up by normalizeTags before it is stored.
-    tags:             { type: 'string',  def: '', max: 400, normalize: normalizeTags },
-    // A ban entered by hand: an ISO time, or '' for none.
-    banUntil:         { type: 'string',  def: '', max: 40, normalize: normalizeBanUntil },
 };
-const ACCOUNT_DEFAULTS = Object.fromEntries(Object.entries(ACCOUNT_FIELDS).map(([k, s]) => [k, s.def]));
 const MAX_USERNAME = 256;
-const MAX_PASSWORD = 1024;
 const MAX_BACKUP_BYTES = 5 * 1024 * 1024;
 const MIN_PASSPHRASE = 8;
 const PENDING_IMPORT_TTL_MS = 10 * 60 * 1000;
@@ -77,7 +38,7 @@ function pickFields(data, base) {
         }
         if (typeof v !== spec.type) return { ok: false, message: `Invalid value for ${key}` };
         if (spec.type === 'string' && v.length > spec.max) return { ok: false, message: `${key} is too long` };
-        fields[key] = spec.normalize ? spec.normalize(v) : v;
+        fields[key] = v;
     }
     return { ok: true, fields };
 }
@@ -106,84 +67,101 @@ let _pendingImport = null;
 function register() {
     ipcMain.handle('get-accounts', () => {
         if (vault.isVaultLocked()) return [];
-        // passwordOk lets the renderer flag accounts whose stored password can't
-        // be decrypted under the current key (e.g. after a Windows update broke
-        // the old wmic-derived key) *before* the user tries to launch and hits
-        // the failure mid-flow — never the plaintext itself, just whether it's
-        // readable. honorFlagged is true once this account's honor level has
-        // dropped below its previously observed peak (see honor-watch.js).
-        //
-        // honor-watch is loaded once here rather than per-account (isHonorFlagged
-        // would otherwise re-read and re-parse the whole file once per account,
-        // O(N) sync disk reads on every get-accounts call).
-        const honorWatch = loadHonorWatch();
-        const statusMap = getStatusMap();
-        const signIns = require('../services/riot-sessions').signInKeys();
-        const collections = require('../services/collection');
-        const collectionMap = collections.getCollectionMap();
-        // Read once; the Valorant catalogue only when an account has Valorant data.
-        const valorant = require('../services/valorant');
-        const valorantMap = valorant.getRecordMap();
-        let valorantContent = null;
-        const valorantOf = (username) => {
-            const rec = valorantMap[String(username).toLowerCase()];
-            if (!rec) return null;
-            valorantContent = valorantContent || valorant.cachedContent();
-            return require('./valorant').summaryFor(rec, valorantContent);
-        };
-        return loadAccounts().map(a => ({
-            ...a,
-            password: '',
-            passwordOk: decrypt(a.password) !== null,
-            honorFlagged: isFlaggedRecord(getHonorRecord(honorWatch, a.username)),
-            status: statusFor(statusMap, a.username),
-            // A saved Riot sign-in: this account starts without typing.
-            savedSignIn: signIns.has(String(a.username).toLowerCase()),
-            // Champions and skins from the last sign-in: counts and the names the search looks in.
-            collection: collections.summaryFor(collectionMap, a.username),
-            // Valorant rank, Valorant Points and owned skin names, from the last sign-in.
-            valorant: valorantOf(a.username),
+        const signIns = riotSessions.signInKeys();
+        return loadAccounts().map(account => ({
+            username: account.username,
+            label: account.label,
+            riotId: account.riotId,
+            region: account.region,
+            minimizeOnLaunch: account.minimizeOnLaunch === true,
+            savedSignIn: signIns.has(String(account.username).toLowerCase()),
+            hasSavedPassword: !!account.encryptedPassword,
         }));
     });
 
-    ipcMain.handle('add-account', (event, data) => {
+    ipcMain.handle('create-account-shortcut', async (event, username) => {
         if (vault.isVaultLocked()) return vault.lockedResult();
-        if (!data || typeof data !== 'object') return { success: false, message: 'Invalid account data' };
-        if (!validUsername(data.username)) return { success: false, message: 'Enter a username' };
-        if (typeof data.password !== 'string' || !data.password) return { success: false, message: 'Enter a password' };
-        if (data.password.length > MAX_PASSWORD) return { success: false, message: 'Password is too long' };
+        if (!validUsername(username)) return { success: false, message: 'Account not found' };
+        try {
+            const account = loadAccounts().find(candidate => sameUser(candidate.username, username));
+            if (!account) return { success: false, message: 'Account not found' };
+            return await createAccountShortcut(state.mainWindow, account);
+        } catch (error) {
+            return errorResult(error);
+        }
+    });
+
+    ipcMain.handle('add-account', async (event, data) => {
+        if (vault.isVaultLocked()) return vault.lockedResult();
+        if (!validUsername(data?.username)) return { success: false, message: 'Enter your Riot login username.' };
         const picked = pickFields(data);
         if (!picked.ok) return { success: false, message: picked.message };
 
         try {
+            const encryptedPassword = await encryptPassword(data.password);
+            if (vault.isVaultLocked()) return vault.lockedResult();
             const accounts = loadAccounts();
-            // Case-insensitive — session/active-account matching elsewhere (launch.js,
-            // lcu-events.js) is case-insensitive, so allowing "Player1" and "player1"
-            // as distinct accounts here would let LCU session detection misattribute
-            // state (appearOffline, auto-skin, "currently active" highlight) to the
-            // wrong one.
-            if (accounts.some(a => sameUser(a.username, data.username))) {
-                return { success: false, message: 'Account already exists' };
+            if (accounts.some(account => sameUser(account.username, data.username))) {
+                return { success: false, message: 'This account is already saved. Use Edit to update its password.' };
             }
-            accounts.push({ username: data.username, password: encrypt(data.password), ...picked.fields });
-            saveAccounts(accounts);
-        } catch (e) {
-            return errorResult(e);
+            saveAccounts([...accounts, { username: data.username, ...picked.fields, encryptedPassword }]);
+        } catch (error) {
+            return errorResult(error);
         }
         broadcastAccountsUpdate();
         return { success: true };
     });
 
-    ipcMain.handle('update-account', (event, data) => {
+    ipcMain.handle('capture-account', async (event, data) => {
+        if (vault.isVaultLocked()) return vault.lockedResult();
+        if (!data || typeof data !== 'object') return { success: false, message: 'Invalid account data' };
+        const picked = pickFields(data);
+        if (!picked.ok) return { success: false, message: picked.message };
+        const { isLaunchInProgress } = require('./launch');
+        const busy = { success: false, message: 'Wait for the current account switch to finish.' };
+        if (isLaunchInProgress()) return busy;
+
+        try {
+            const session = await require('../lcu').request('GET', '/lol-login/v1/session');
+            if (vault.isVaultLocked()) return vault.lockedResult();
+            if (isLaunchInProgress()) return busy;
+            const username = session?.username;
+            if (!validUsername(username)) {
+                return { success: false, message: 'Sign in through the Riot Client, tick "Stay signed in", and open League first.' };
+            }
+
+            const wasSaved = riotSessions.hasSignIn(username);
+            const captured = await riotSessions.captureSignIn(username, () => !vault.isVaultLocked() && !isLaunchInProgress());
+            if (vault.isVaultLocked()) return vault.lockedResult();
+            if (isLaunchInProgress()) return busy;
+            if (!captured) {
+                return { success: false, message: 'No saved Riot session was found. Sign in with "Stay signed in" ticked, then try again with League open.' };
+            }
+            const accounts = loadAccounts();
+            const existing = accounts.find(account => sameUser(account.username, username));
+            if (!existing) {
+                try {
+                    saveAccounts([...accounts, { username, ...picked.fields }]);
+                } catch (error) {
+                    if (!wasSaved) riotSessions.forgetSignIn(username);
+                    throw error;
+                }
+            }
+        } catch (error) {
+            return errorResult(error);
+        }
+        broadcastAccountsUpdate();
+        return { success: true };
+    });
+
+    ipcMain.handle('update-account', async (event, data) => {
         if (vault.isVaultLocked()) return vault.lockedResult();
         if (!data || typeof data !== 'object' || typeof data.username !== 'string') return { success: false, message: 'Invalid account data' };
-        if (data.password !== undefined && data.password !== null && data.password !== '' &&
-            (typeof data.password !== 'string' || data.password.length > MAX_PASSWORD)) {
-            return { success: false, message: 'Invalid password' };
-        }
-
-        let updated;
         try {
+            const encryptedPassword = data.password === undefined || data.password === ''
+                ? null
+                : await encryptPassword(data.password);
+            if (vault.isVaultLocked()) return vault.lockedResult();
             const accounts = loadAccounts();
             const index    = accounts.findIndex(a => sameUser(a.username, data.username));
             if (index === -1) return { success: false, message: 'Account not found' };
@@ -191,19 +169,17 @@ function register() {
             const old = accounts[index];
             const picked = pickFields(data, old);
             if (!picked.ok) return { success: false, message: picked.message };
-            updated = { ...old, ...picked.fields };
-            if (data.password) updated.password = encrypt(data.password);
+            const updated = { ...old, ...picked.fields };
+            if (encryptedPassword) {
+                updated.encryptedPassword = encryptedPassword;
+                delete updated.password;
+            }
             accounts[index] = updated;
             saveAccounts(accounts);
         } catch (e) {
             return errorResult(e);
         }
         broadcastAccountsUpdate();
-
-        // Live-update active account settings without disrupting login state
-        if (sameUser(state.currentAccount?.username, updated.username)) {
-            state.currentAccount = { ...state.currentAccount, ...updated, password: state.currentAccount.password };
-        }
 
         return { success: true };
     });
@@ -217,20 +193,7 @@ function register() {
             if (index === -1) return { success: false, message: 'Account not found' };
             const [removed] = accounts.splice(index, 1);
             saveAccounts(accounts);
-            // Re-adding the same username later must not inherit an old honor flag.
-            forgetHonor(removed.username);
-            forgetStatus(removed.username);
-            require('../services/riot-sessions').forgetSignIn(removed.username);
-            require('../services/collection').forgetCollection(removed.username);
-            require('../services/valorant').forgetAccount(removed.username);
-            // Games and rank history are kept per Riot ID; drop them with the
-            // last account that has it.
-            const riotId = (removed.riotId || '').trim().toLowerCase();
-            if (riotId && !accounts.some(a => (a.riotId || '').trim().toLowerCase() === riotId)) {
-                require('../services/matches').forgetMatches(riotId);
-                require('../services/rank-history').forgetRankHistory(riotId);
-            }
-            if (sameUser(state.currentAccount?.username, removed.username)) state.currentAccount = null;
+            riotSessions.forgetSignIn(removed.username);
         } catch (e) {
             return errorResult(e);
         }
@@ -243,10 +206,10 @@ function register() {
     ipcMain.handle('unlock-vault', async (event, password) => {
         const wasLocked = vault.isVaultLocked();
         const res = await vault.unlockVault(password);
-        // Tray menu and jump list list no accounts while locked; rebuild them.
         if (res.success && wasLocked) {
             broadcastAccountsUpdate();
-            require('../lcu-events').onVaultUnlocked().catch((e) => console.log('[LCU] After unlock:', e.message));
+            const { resumeExternalLaunch } = require('./launch');
+            resumeExternalLaunch()?.catch(error => console.error('[Launch] Could not resume shortcut:', error.message));
         }
         return res;
     });
@@ -264,42 +227,6 @@ function register() {
         return res;
     });
 
-    ipcMain.handle('get-account-password', (event, username) => {
-        // The renderer's lock screen is only a UI gate — enforce the vault here too,
-        // otherwise anything that can call exposed IPC methods (e.g. devtools) could
-        // read every plaintext password without ever unlocking. Returns a string or
-        // null (also while locked), which is what the renderer checks.
-        if (vault.isVaultLocked()) return null;
-        if (typeof username !== 'string') return null;
-        const acc = loadAccounts().find(a => sameUser(a.username, username));
-        if (!acc) return null;
-        return decrypt(acc.password);
-    });
-
-    ipcMain.handle('reorder-accounts', (event, usernames) => {
-        if (vault.isVaultLocked()) return vault.lockedResult();
-        if (!Array.isArray(usernames) || !usernames.every(u => typeof u === 'string')) {
-            return { success: false, message: 'Invalid order' };
-        }
-        try {
-            const accounts = loadAccounts();
-            const map = new Map(accounts.map(a => [a.username.toLowerCase(), a]));
-            const ordered = [];
-            const included = new Set();
-            for (const u of usernames) {
-                const a = map.get(u.toLowerCase());
-                if (a && !included.has(a)) { ordered.push(a); included.add(a); }
-            }
-            // Append any accounts not present in the new order list (safety net)
-            accounts.filter(a => !included.has(a)).forEach(a => ordered.push(a));
-            saveAccounts(ordered);
-        } catch (e) {
-            return errorResult(e);
-        }
-        broadcastAccountsUpdate();
-        return { success: true };
-    });
-
     // usernames: export only these (Select in the account list), else all.
     ipcMain.handle('export-accounts', async (event, passphrase, usernames = null) => {
         if (vault.isVaultLocked()) return vault.lockedResult();
@@ -310,26 +237,23 @@ function register() {
         try {
             const result = await dialog.showSaveDialog(state.mainWindow, {
                 title: 'Export Accounts',
-                defaultPath: 'lost-league-accounts.llem',
-                filters: [{ name: 'Lost League Backup', extensions: ['llem'] }],
+                defaultPath: 'league-accounts.lalbackup',
+                filters: [{ name: 'League Account Backup', extensions: ['lalbackup'] }],
             });
             if (result.canceled || !result.filePath) return { success: false, canceled: true };
 
             const only = Array.isArray(usernames) ? new Set(usernames.filter((u) => typeof u === 'string').map((u) => u.toLowerCase())) : null;
             const accounts = loadAccounts().filter((a) => !only || only.has(a.username.toLowerCase()));
-            let unreadable = 0;
             const exportData = {
                 version: 1,
                 exported: Date.now(),
-                accounts: accounts.map(a => {
-                    const password = decrypt(a.password);
-                    if (password === null) unreadable++;
-                    const picked = pickFields(a, ACCOUNT_DEFAULTS);
-                    return { username: a.username, password: password ?? '', ...(picked.ok ? picked.fields : {}) };
+                accounts: accounts.map(account => {
+                    const picked = pickFields(account);
+                    return { username: account.username, ...(picked.ok ? picked.fields : {}) };
                 }),
             };
             writeFileAtomic(result.filePath, await encryptExport(exportData, passphrase));
-            return { success: true, count: accounts.length, unreadable };
+            return { success: true, count: accounts.length };
         } catch (e) {
             return errorResult(e);
         }
@@ -357,7 +281,7 @@ function register() {
             } else {
                 const result = await dialog.showOpenDialog(state.mainWindow, {
                     title: 'Import Accounts',
-                    filters: [{ name: 'Lost League Backup', extensions: ['llem'] }],
+                    filters: [{ name: 'League Account Backup', extensions: ['lalbackup', 'llem'] }],
                     properties: ['openFile'],
                 });
                 if (result.canceled || !result.filePaths?.length) return { success: false, canceled: true };
@@ -399,26 +323,20 @@ function register() {
 
 function importRecords(records) {
     const existing = loadAccounts();
-    let added = 0, duplicates = 0, invalid = 0, withoutPassword = 0;
+    let added = 0, duplicates = 0, invalid = 0;
     for (const acc of records) {
         if (!acc || typeof acc !== 'object' || !validUsername(acc.username)) { invalid++; continue; }
-        // Accounts whose password could not be read at export come with ''.
-        // Keep them (label, notes, Riot ID); the app asks for the password.
-        const password = acc.password ?? '';
-        if (typeof password !== 'string' || password.length > MAX_PASSWORD) { invalid++; continue; }
         const picked = pickFields(acc);
         if (!picked.ok) { invalid++; continue; }
         if (existing.some(e => sameUser(e.username, acc.username))) { duplicates++; continue; }
-        // encrypt() throws without the machine key; nothing is saved then.
-        existing.push({ username: acc.username, password: password ? encrypt(password) : '', ...picked.fields });
-        if (!password) withoutPassword++;
+        existing.push({ username: acc.username, ...picked.fields });
         added++;
     }
     if (added > 0) {
         saveAccounts(existing);
         broadcastAccountsUpdate();
     }
-    return { success: true, added, skipped: duplicates + invalid, duplicates, invalid, withoutPassword };
+    return { success: true, added, skipped: duplicates + invalid, duplicates, invalid };
 }
 
 module.exports = { register };

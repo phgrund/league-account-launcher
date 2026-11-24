@@ -1,150 +1,92 @@
-const { app, globalShortcut, dialog } = require('electron');
-const lcu = require('./lcu');
+const { app, dialog } = require('electron');
+const state = require('./state');
+const { loadConfig, saveConfig, checkDataFiles, dataFileProblemText } = require('./services/storage');
+const jsonStore = require('./services/json-store');
+const { resolveLolPath } = require('./services/league-path');
+const { applyTheme } = require('./ipc/config');
+const { registerAll } = require('./ipc/index');
+const { launchFromOutside, cancelLaunch } = require('./ipc/launch');
+const windows = require('./windows');
 
-// The interface is English, so dates, numbers and the date picker are too,
-// whatever language Windows uses (they read "Mi., 4. Nov." on a German PC).
 app.commandLine.appendSwitch('lang', 'en-US');
 
-// ── Shared state must be required before anything that imports it ────────────
-const state = require('./state');
-
-// ── Core modules ─────────────────────────────────────────────────────────────
-const { loadConfig, saveConfig, migratePasswords, dataFileProblemText } = require('./services/storage');
-const jsonStore = require('./services/json-store');
-const { resolveLolPath }               = require('./services/league-path');
-const { fetchChampionData }            = require('./services/champion-data');
-const { fetchItemData }                = require('./services/item-data');
-const { registerLcuEvents }            = require('./lcu-events');
-const { initAutoUpdater }              = require('./ipc/updater');
-const { registerAll: registerIpc }     = require('./ipc/index');
-const { launchFromOutside } = require('./ipc/launch');
-const windows = require('./windows');
-const { initOverwolf } = require('./overwolf');
-const discordRpc = require('./services/discord-rpc');
-
-// Jump-list entries pass `--launch=<username>`; usernames may contain '='.
 function launchArgUsername(argv) {
+    const encoded = argv.find(arg => arg.startsWith('--launch-account='));
+    if (encoded) {
+        const selection = encoded.slice('--launch-account='.length);
+        if (!/^[\w-]{1,1400}$/.test(selection)) return null;
+        const username = Buffer.from(selection, 'base64url').toString('utf8');
+        return username || null;
+    }
     const arg = argv.find(a => a.startsWith('--launch='));
     return arg ? arg.slice('--launch='.length) : null;
 }
 
-// ── Single-instance lock ──────────────────────────────────────────────────────
-app.isQuiting = false;
-const gotLock = app.requestSingleInstanceLock();
+let pendingLaunch = launchArgUsername(process.argv);
+let initializingWindow = false;
 
-if (!gotLock) {
+function launchRequested(username) {
+    if (!state.mainWindow || initializingWindow) {
+        pendingLaunch = username;
+        return;
+    }
+    return launchFromOutside(username);
+}
+
+function initialize() {
+    try {
+        loadConfig();
+        applyTheme();
+        checkDataFiles();
+    } catch (error) {
+        dialog.showErrorBox('League Account Launcher', `Could not read saved accounts or settings:\n${error.message}`);
+    }
+
+    const resolvedLolPath = resolveLolPath(state.config.lolPath);
+    if (resolvedLolPath && resolvedLolPath !== state.config.lolPath) {
+        state.config.lolPath = resolvedLolPath;
+        try { saveConfig(); } catch (error) { console.error('[Boot] Could not save the detected League path:', error.message); }
+    }
+
+    registerAll();
+    windows.setLaunchCallback(launchFromOutside);
+    initializingWindow = true;
+    windows.createMainWindow();
+    windows.createTray();
+    windows.updateJumpList();
+
+    jsonStore.setNoticeListener((notice) => {
+        const win = state.mainWindow;
+        if (win && !win.isDestroyed()) win.webContents.send('data-file-problem', dataFileProblemText(notice));
+    });
+    jsonStore.markBooted();
+
+    state.mainWindow.webContents.once('did-finish-load', () => {
+        initializingWindow = false;
+        const username = pendingLaunch;
+        pendingLaunch = null;
+        if (username) launchRequested(username)?.catch(error => console.error('[Launch] Could not open shortcut:', error.message));
+    });
+}
+
+app.isQuiting = false;
+if (!app.requestSingleInstanceLock()) {
     app.quit();
 } else {
     app.on('second-instance', (event, commandLine) => {
         const username = launchArgUsername(commandLine);
-        // launchFromOutside shows the window itself (lock screen while the
-        // vault is locked) unless the account minimizes on launch.
-        if (username) {
-            launchFromOutside(username);
-        } else if (state.mainWindow) {
-            state.mainWindow.show();
-            if (state.mainWindow.isMinimized()) state.mainWindow.restore();
-            state.mainWindow.focus();
-        }
+        if (username) return launchRequested(username)?.catch(error => console.error('[Launch] Could not open shortcut:', error.message));
+        windows.showMainWindow();
+    });
+    app.whenReady().then(initialize).catch((error) => {
+        dialog.showErrorBox('League Account Launcher', `Could not start the app:\n${error.message}`);
+        app.quit();
     });
 }
 
-// ── App ready ─────────────────────────────────────────────────────────────────
-app.whenReady().then(async () => {
-    // These touch disk (config/accounts.json) or the network (Data Dragon) and
-    // can throw — previously an unhandled rejection here (e.g. accounts.json
-    // locked by AV/OneDrive, or a full disk) would silently kill the entire
-    // boot sequence with no window, no tray, and no visible error.
-    try {
-        loadConfig();
-        require('./ipc/config').applyTheme();
-        migratePasswords();
-    } catch (e) {
-        console.error('[Boot] Failed to load/migrate account data:', e.message);
-        dialog.showErrorBox('Lost League Manager',
-            `Failed to read your saved accounts/settings:\n${e.message}\n\n` +
-            'The app will still start. If a file was damaged, a copy of it was kept next to it ' +
-            '(named above); otherwise check that accounts.json/config.json are not locked by ' +
-            'another program, such as antivirus or OneDrive.');
-    }
-
-    // Heal a stale/wrong lolPath (moved drive, reinstalled, first run) before
-    // anything starts polling for the LCU connection.
-    const resolvedLolPath = resolveLolPath(state.config.lolPath);
-    if (resolvedLolPath && resolvedLolPath !== state.config.lolPath) {
-        console.log(`[Boot] League install auto-detected at ${resolvedLolPath}`);
-        state.config.lolPath = resolvedLolPath;
-        // A config.json that could not be read refuses saves; boot goes on.
-        try { saveConfig(); } catch (e) { console.error('[Boot] Could not save the detected League path:', e.message); }
-    }
-
-    try {
-        windows.createMainWindow();
-        windows.createTray();
-        windows.setLaunchCallback(launchFromOutside);
-        windows.updateJumpList();
-
-        registerIpc();
-        registerLcuEvents();
-
-        // From here on, a data file that turns out damaged or unreadable is
-        // not overwritten; the renderer shows what happened.
-        jsonStore.setNoticeListener((notice) => {
-            const win = state.mainWindow;
-            if (win && !win.isDestroyed()) win.webContents.send('data-file-problem', dataFileProblemText(notice));
-        });
-        jsonStore.markBooted();
-        initOverwolf();
-        // The overlay window and its hotkey come from overlay-manager.js once
-        // Overwolf's overlay package is ready (or failed), if the overlay is on.
-        // The update check and Discord load large libraries: they start once
-        // the window shows its content, so they never hold up the first paint.
-        state.mainWindow.webContents.once('did-finish-load', () => setTimeout(() => {
-            initAutoUpdater();
-            discordRpc.init();
-        }, 1500));
-        // Data Dragon is fetched once the window has its content, so the
-        // download (and its HTTP library) never delays the first paint.
-        // Handlers that need the champion maps await championData.whenReady().
-        state.mainWindow.webContents.once('did-finish-load', () => {
-            fetchChampionData()
-                .catch(e => console.error('[Boot] fetchChampionData failed:', e.message))
-                .then(() => fetchItemData());
-        });
-    } catch (e) {
-        console.error('[Boot] Failed to initialize application window:', e.message);
-        dialog.showErrorBox('Lost League Manager', `Failed to start:\n${e.message}`);
-        app.quit();
-        return;
-    }
-
-    // Handle --launch= argument on first run, once the page is loaded: the
-    // launch's first messages were sent before the renderer listened, and
-    // its result (errors included) was dropped.
-    const launchUsername = launchArgUsername(process.argv);
-    if (launchUsername) {
-        state.mainWindow.webContents.once('did-finish-load', () => launchFromOutside(launchUsername));
-    }
-
-    // Poll for LCU connection
-    setInterval(() => lcu.connect(state.config.lolPath), 5000);
-
-    app.on('activate', () => {
-        if (!state.mainWindow) windows.createMainWindow();
-    });
-});
-
-app.on('window-all-closed', () => {
-    lcu.stop();
-    globalShortcut.unregisterAll();
-    if (app.isQuiting && process.platform !== 'darwin') app.quit();
-});
-
 app.on('before-quit', () => {
-    // Every quit (installer, OS shutdown, app.quit()) must get past the
-    // window's hide-to-tray close handler, not only the tray's Quit item.
     app.isQuiting = true;
-    discordRpc.shutdown();
+    cancelLaunch();
 });
 
 module.exports = { launchArgUsername };

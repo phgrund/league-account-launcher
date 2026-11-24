@@ -1,182 +1,71 @@
-const { ipcMain, app, nativeTheme } = require('electron');
+const { ipcMain, dialog, nativeTheme } = require('electron');
 const fs = require('fs');
 const path = require('path');
 const state = require('../state');
 const { saveConfig } = require('../services/storage');
-const secrets = require('../services/secrets');
 const { isVaultEnabled } = require('../services/vault');
-const discordRpc = require('../services/discord-rpc');
-
-// UI scale steps offered in Settings, with some room for hand-edited values.
-const MIN_UI_SCALE = 0.5;
-const MAX_UI_SCALE = 2.0;
-
-function isLeagueClientPath(v) {
-    return typeof v === 'string' && path.isAbsolute(v) &&
-        path.basename(v).toLowerCase() === 'leagueclient.exe' && fs.existsSync(v);
-}
-
-// Whitelist of keys the renderer is allowed to set, with a check for each —
-// set-config used to Object.assign() the raw payload straight into live
-// config, so any bug (or compromised renderer) could inject unknown keys or
-// overwrite sensitive ones with the wrong shape. Secrets and the vault have
-// their own calls (set-riot-api-key, set-vault-password, disable-vault) and
-// are refused here.
-const ALLOWED_CONFIG_KEYS = {
-    autoAccept:            v => typeof v === 'boolean',
-    autoImportBuild:       v => typeof v === 'boolean',
-    checkUpdatesOnStartup: v => typeof v === 'boolean',
-    discordRpcEnabled:     v => typeof v === 'boolean',
-    discordShowDetails:    v => typeof v === 'boolean',
-    lastSeenPatchNotesVersion: v => typeof v === 'string' && v.length <= 64,
-    density:               v => DENSITIES.includes(v),
-    game:                  v => GAMES.includes(v),
-    // Launch and repair start or delete files next to this path.
-    lolPath:               isLeagueClientPath,
-    minimizeOnGameStart:   v => typeof v === 'boolean',
-    onboardingDone:        v => typeof v === 'boolean',
-    overlayEnabled:        v => typeof v === 'boolean',
-    overlayLocked:         v => typeof v === 'boolean',
-    overlayShowBuilds:     v => typeof v === 'boolean',
-    overlayShowRanked:     v => typeof v === 'boolean',
-    startMinimized:        v => typeof v === 'boolean',
-    staySignedIn:          v => typeof v === 'boolean',
-    startWithWindows:      v => typeof v === 'boolean',
-    toastOnQueuePop:       v => typeof v === 'boolean',
-    theme:                 v => THEMES.includes(v),
-    uiScale:               v => typeof v === 'number' && Number.isFinite(v) && v >= MIN_UI_SCALE && v <= MAX_UI_SCALE,
-    valorantAutoSets:      v => typeof v === 'boolean',
-};
-const GAMES = ['lol', 'valorant'];
-
-// Never sent to the renderer.
-const PRIVATE_CONFIG_KEYS = ['riotApiKey', 'riotApiKeyEnc', 'henrikKeyEnc', 'vaultPasswordHash', 'vaultHash', 'vaultSalt', 'vaultKdf'];
-
-function publicConfig() {
-    const out = { ...state.config };
-    for (const k of PRIVATE_CONFIG_KEYS) delete out[k];
-    out.vaultEnabled  = isVaultEnabled();
-    out.riotApiKeySet = secrets.hasRiotApiKey();
-    out.henrikKeySet  = secrets.hasHenrikKey();
-    out.lolPathFound  = isLeagueClientPath(state.config.lolPath);
-    return out;
-}
-
-function pushOverlaySettings() {
-    const ow = state.overlayWindow;
-    if (!ow || ow.isDestroyed()) return;
-    ow.webContents.send('overlay-settings-update', {
-        showRanked: state.config.overlayShowRanked !== false,
-        showBuilds: state.config.overlayShowBuilds !== false,
-        locked:     state.config.overlayLocked     || false,
-    });
-}
 
 const THEMES = ['system', 'light', 'dark'];
-// 'roomy' brings back the larger controls and rows of 1.7.
-const DENSITIES = ['compact', 'roomy'];
+const ALLOWED_CONFIG_KEYS = new Map([
+    ['lolPath', isLeagueClientPath],
+    ['theme', value => THEMES.includes(value)],
+    ['startMinimized', value => typeof value === 'boolean'],
+]);
 
-// The renderer's prefers-color-scheme follows nativeTheme.themeSource, in
-// every window, so this one call switches the whole app.
+function isLeagueClientPath(value) {
+    if (typeof value !== 'string' || !path.isAbsolute(value) || path.basename(value).toLowerCase() !== 'leagueclient.exe') {
+        return false;
+    }
+    try {
+        return fs.statSync(value).isFile();
+    } catch {
+        return false;
+    }
+}
+
 function applyTheme() {
     nativeTheme.themeSource = THEMES.includes(state.config.theme) ? state.config.theme : 'system';
 }
 
 function register() {
-    ipcMain.handle('get-config', () => {
-        state.config.startWithWindows = app.getLoginItemSettings().openAtLogin;
-        return publicConfig();
+    ipcMain.handle('get-config', () => ({
+        lolPath: state.config.lolPath,
+        lolPathFound: isLeagueClientPath(state.config.lolPath),
+        theme: nativeTheme.themeSource,
+        startMinimized: state.config.startMinimized === true,
+        vaultEnabled: isVaultEnabled(),
+    }));
+
+    ipcMain.handle('choose-league-path', async () => {
+        const result = await dialog.showOpenDialog(state.mainWindow, {
+            title: 'Find LeagueClient.exe',
+            filters: [{ name: 'Applications', extensions: ['exe'] }],
+            properties: ['openFile'],
+        });
+        const selected = result.filePaths?.[0];
+        if (result.canceled || !selected) return { success: false, canceled: true };
+        if (!isLeagueClientPath(selected)) return { success: false, message: 'Select LeagueClient.exe.' };
+        return { success: true, path: selected };
     });
 
-    ipcMain.handle('set-riot-api-key', (event, key) => {
-        const prev = { riotApiKey: state.config.riotApiKey, riotApiKeyEnc: state.config.riotApiKeyEnc };
-        const res = secrets.setRiotApiKey(state.config, key);
-        if (!res.success) return res;
+    ipcMain.handle('set-config', (event, settings) => {
+        if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
+            return { success: false, message: 'Invalid settings.' };
+        }
+        const previous = {};
+        for (const [key, value] of Object.entries(settings)) {
+            const validate = ALLOWED_CONFIG_KEYS.get(key);
+            if (!validate?.(value)) return { success: false, message: `Invalid value for ${key}.` };
+            previous[key] = state.config[key];
+        }
+        Object.assign(state.config, settings);
         try {
             saveConfig();
-        } catch (e) {
-            for (const [k, v] of Object.entries(prev)) {
-                if (v === undefined) delete state.config[k]; else state.config[k] = v;
-            }
-            secrets.loadSecrets(state.config);
-            return { success: false, message: `Could not save the key: ${e.message}` };
+        } catch (error) {
+            Object.assign(state.config, previous);
+            return { success: false, message: `Could not save settings: ${error.message}` };
         }
-        return { success: true };
-    });
-
-    ipcMain.handle('set-config', (event, newConfig) => {
-        if (!newConfig || typeof newConfig !== 'object') return { success: false, message: 'Invalid config payload' };
-
-        const prev = { ...state.config };
-        const rejected = [];
-        for (const [key, value] of Object.entries(newConfig)) {
-            const isValid = ALLOWED_CONFIG_KEYS[key];
-            if (!isValid) { console.warn(`[Config] Rejected unknown config key: ${key}`); rejected.push(key); continue; }
-            if (!isValid(value)) { console.warn(`[Config] Rejected invalid value for config key: ${key}`); rejected.push(key); continue; }
-            state.config[key] = value;
-        }
-        if (rejected.length < Object.keys(newConfig).length) {
-            try {
-                saveConfig();
-            } catch (e) {
-                Object.assign(state.config, prev);
-                return { success: false, message: `Could not save settings: ${e.message}` };
-            }
-        }
-
-        // Compare against what was actually applied to state.config (post-validation),
-        // not the raw payload — a rejected/invalid value must not trigger side effects.
-        const ow = state.overlayWindow;
-        if (ow && !ow.isDestroyed()) {
-            // Live-toggle overlay visibility when overlayEnabled changes
-            if (state.config.overlayEnabled !== prev.overlayEnabled) {
-                if (!state.config.overlayEnabled) {
-                    ow.hide();
-                }
-                // When re-enabled, show only if a game is currently in progress (handled by lcu-events)
-            }
-
-            // Push panel visibility / lock changes live
-            const panelKeys = ['overlayShowRanked', 'overlayShowBuilds', 'overlayLocked'];
-            if (panelKeys.some(k => state.config[k] !== prev[k])) {
-                pushOverlaySettings();
-            }
-        }
-
-        // Switched on: create the window (and hotkey); off: remove both.
-        if (state.config.overlayEnabled !== prev.overlayEnabled) {
-            const manager = require('../overlay-manager');
-            if (state.config.overlayEnabled) manager.ensureOverlay();
-            else manager.destroyOverlay();
-        }
-
-        if (state.config.startWithWindows !== prev.startWithWindows) {
-            app.setLoginItemSettings({ openAtLogin: !!state.config.startWithWindows });
-        }
-
-        if (state.config.theme !== prev.theme) applyTheme();
-
-        if (state.config.valorantAutoSets !== prev.valorantAutoSets) {
-            const valorant = require('../services/valorant');
-            if (state.config.valorantAutoSets) valorant.startAgentWatch();
-            else valorant.stopAgentWatch();
-        }
-
-        if (state.config.discordShowDetails !== prev.discordShowDetails && state.config.discordShowDetails === false) {
-            discordRpc.setContext({});
-        }
-        if (state.config.discordRpcEnabled !== prev.discordRpcEnabled) {
-            discordRpc.setEnabled(state.config.discordRpcEnabled);
-        }
-
-        // Previously always returned success even when every key in the payload
-        // was silently dropped (unknown key, or wrong type) — callers had no way
-        // to tell "applied" from "quietly ignored" short of grepping main-process
-        // logs, so the renderer would show "updated!" for a change that never
-        // actually took effect.
-        if (rejected.length > 0) {
-            return { success: false, message: `Rejected invalid config key(s): ${rejected.join(', ')}`, rejected };
-        }
+        applyTheme();
         return { success: true };
     });
 }
